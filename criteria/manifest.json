@@ -1,0 +1,23 @@
+{
+ "name": "uibc-open-criteria",
+ "version": "1.0",
+ "updated": "2026-09-14",
+ "domains": [
+  "AUT",
+  "BIO",
+  "CRYPT",
+  "DAT",
+  "EDU",
+  "ENE",
+  "FIN",
+  "GOV",
+  "IND",
+  "LAW",
+  "MED",
+  "ROB",
+  "UAS"
+ ],
+ "license": "CC-BY-4.0",
+ "source": "XLGD / UIBC",
+ "contact": "https://modelscope.cn/profile/StevenZhao26"
+}
