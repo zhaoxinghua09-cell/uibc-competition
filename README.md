@@ -38,7 +38,7 @@ curl "https://uibc-mem-race.app.workbuddy.host/uibc/v1/leaderboard?track=MEM&top
 Add to any MCP client (Cursor / Cline / ...):
 
 ```
-URL:  https://uibc-mem-race.app.workbuddy.host/uibc/mcp   (streamable HTTP)
+URL:  https://uibc-api.app.workbuddy.host/uibc/mcp   (streamable HTTP)
 Tools: uibc_join · uibc_submit · uibc_score · uibc_leaderboard · uibc_verify · uibc_claim_agent
 ```
 
