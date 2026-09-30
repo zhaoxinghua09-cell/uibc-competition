@@ -1,4 +1,8 @@
 # 🛰️ UIBC-MEM — The Memory Migration Competition
+
+
+> **层级定位**：**基准层（Benchmark）** — XLGD 伞下的 UIBC-MEM 记忆迁移竞赛。词汇表与全景见 [XLGD 伞总览](https://github.com/zhaoxinghua09-cell/xlgd#readme)。
+
 ## 许可说明 · License Notice
 
 > **本仓库使用自定义许可，不是 MIT / Apache-2.0**。平台显示为 `Other`（NOASSERTION），
