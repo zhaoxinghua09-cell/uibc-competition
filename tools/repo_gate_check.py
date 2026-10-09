@@ -59,7 +59,22 @@ CFF_REQUIRED_KEYS = ["title", "version", "date-released", "authors"]
 LINK_FILES = ["README.md", "TLDR.md"]
 
 # `## v1.6.0`, `## 1.6.0`, `## [0.2.1] — 2026-09-17` ; NOT `## [Unreleased]`
-CHANGELOG_VER_RE = re.compile(r"^##\s+\[?\s*[vV]?(\d+\.\d+(?:\.\d+)?)\s*\]?")
+CHANGELOG_VER_RE = re.compile(r"^##(?!#)\s*\[?\s*[vV]?(\d+\.\d+(?:\.\d+)?)\s*\]?")
+
+
+def _unfenced_lines(text: str) -> list[str]:
+    """Drop lines inside ``` / ~~~ code fences: a fenced `## v9.9.9` is docs,
+    not a release heading (treating it as one is a false red)."""
+    out: list[str] = []
+    fenced = False
+    for line in text.splitlines():
+        s = line.lstrip()
+        if s.startswith("```") or s.startswith("~~~"):
+            fenced = not fenced
+            out.append("")
+            continue
+        out.append("" if fenced else line)
+    return out
 
 
 class Report:
@@ -129,7 +144,7 @@ def cff_value_status(text: str, key: str) -> tuple[str | None, str]:
 def changelog_newest(text: str) -> str | None:
     """The MAXIMUM released version heading (not merely the first one)."""
     vers: list[str] = []
-    for line in text.splitlines():
+    for line in _unfenced_lines(text):
         m = CHANGELOG_VER_RE.match(line)
         if m:
             vers.append(norm_ver(m.group(1)))
@@ -178,8 +193,42 @@ def _reference_targets(text: str) -> list[str]:
             re.finditer(r"^\s*\[[^\]]+\]:\s*(\S+)", text, re.M)]
 
 
+def _resolve_inside(root: Path, path_part: str) -> tuple[bool, bool]:
+    """Return (escapes, exists).
+
+    `escapes` is True if the link leaves the tree at ANY point on the way down,
+    not merely if its final resolved path is outside. This closes the
+    "escape-and-return" bypass `../<this-repo>/docs/x.md`, which resolves back
+    inside the tree yet is a dead link on GitHub (a `..` above the repo root is
+    a 404).
+
+    `exists` is checked segment-by-segment against an exact-case directory
+    listing, so the verdict does not depend on the host filesystem's case
+    sensitivity (Windows/macOS would otherwise hide a case-only mismatch that
+    Linux CI reds).
+    """
+    segs = [s for s in path_part.replace("\\", "/").split("/") if s not in ("", ".")]
+    depth = 0
+    cur = root
+    for s in segs:
+        if s == "..":
+            if depth == 0:
+                return True, False
+            depth -= 1
+            cur = cur.parent
+            continue
+        depth += 1
+        try:
+            names = {e.name for e in os.scandir(cur)}
+        except OSError:
+            return False, False
+        if s not in names:
+            return False, False
+        cur = cur / s
+    return False, True
+
+
 def check_links(root: Path, rep: Report) -> None:
-    root_res = root.resolve()
     seen_dead = 0
     seen_live = 0
     checked: list[str] = []
@@ -195,14 +244,11 @@ def check_links(root: Path, rep: Report) -> None:
             path_part = target.split("#", 1)[0].split("?", 1)[0].strip()
             if not path_part:
                 continue
-            resolved = (root / path_part).resolve()
-            try:
-                resolved.relative_to(root_res)
-            except ValueError:
+            escapes, exists = _resolve_inside(root, path_part)
+            if escapes:
                 seen_dead += 1
                 rep.bad(f"{rel}: relative link escapes the tree -> {target}")
-                continue
-            if resolved.exists():
+            elif exists:
                 seen_live += 1
             else:
                 seen_dead += 1
@@ -213,30 +259,93 @@ def check_links(root: Path, rep: Report) -> None:
 
 
 # ------------------------------------------------------------------ license --
+# --- license logic -------------------------------------------------------
+#
+# Two hard lessons (both found by independent review on 2026-10-09):
+#  (i) "All rights reserved" is *boilerplate* in many MIT/Apache LICENSE files.
+#      Reading it first made the gate (a) false-red a genuine MIT license and
+#      (b) false-green a LICENSE that grants MIT while CITATION claims ARR.
+#      Fix: an explicit standard-license marker always wins; the reserved-rights
+#      phrase is consulted only when no standard header is present.
+#  (ii) CFF 1.2.0 `license` is a *strict enum* of SPDX ids: `LicenseRef-*`,
+#      `All Rights Reserved`, `NONE`, `NOASSERTION` are NOT valid values. When a
+#      work is not under an SPDX-listed license, the spec's fallback is to omit
+#      `license:` and provide `license-url:`. This gate enforces that.
+_STANDARD_MARKERS = [
+    ("apache-2.0", r"apache\s+license[^\n]{0,40}2\.0"),
+    ("mit", r"\bmit\s+license\b"),
+    ("bsd-3-clause", r"bsd\s+3-?clause"),
+    ("bsd-2-clause", r"bsd\s+2-?clause"),
+    ("gpl-3.0", r"gnu\s+general\s+public\s+license[^\n]{0,40}(version\s*3|v3)"),
+    ("lgpl-3.0", r"gnu\s+lesser\s+general\s+public\s+license"),
+    ("mpl-2.0", r"mozilla\s+public\s+license[^\n]{0,40}(2\.0|version\s*2)"),
+    ("isc", r"\bisc\s+license\b"),
+    ("unlicense", r"\bthe\s+unlicense\b|this\s+is\s+free\s+and\s+unencumbered"),
+    ("cc0-1.0", r"cc0[\s\-]1\.0|creative\s+commons\s+zero"),
+    ("cc-by-4.0", r"creative\s+commons\s+attribution[^\n]{0,40}4\.0|cc[-\s]by[-\s]4\.0"),
+]
+
+# A curated subset of the CFF 1.2.0 `license-enum` (SPDX ids).  Kept in a
+# lowercased lookup so comparison is case-insensitive.  The authoritative check
+# is the schema validation CI step; this is the offline-deterministic subset.
+_CFF_ENUM: set[str] = {
+    x.lower() for x in [
+        "0BSD", "AFL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later", "Apache-1.1",
+        "Apache-2.0", "Artistic-2.0", "Beerware", "BSD-2-Clause", "BSD-3-Clause",
+        "BSD-3-Clause-Clear", "BSD-4-Clause", "BSL-1.0", "CC-BY-3.0", "CC-BY-4.0",
+        "CC-BY-NC-4.0", "CC-BY-NC-ND-4.0", "CC-BY-NC-SA-4.0", "CC-BY-ND-4.0",
+        "CC-BY-SA-4.0", "CC0-1.0", "CECILL-2.1", "EPL-1.0", "EPL-2.0", "EUPL-1.1",
+        "EUPL-1.2", "GPL-2.0-only", "GPL-2.0-or-later", "GPL-3.0-only",
+        "GPL-3.0-or-later", "ISC", "LGPL-2.1-only", "LGPL-2.1-or-later",
+        "LGPL-3.0-only", "LGPL-3.0-or-later", "MIT", "MIT-0", "MPL-1.1", "MPL-2.0",
+        "MS-PL", "MS-RL", "NCSA", "ODbL-1.0", "OFL-1.1", "OSL-3.0", "PostgreSQL",
+        "Python-2.0", "Unlicense", "UPL-1.0", "Vim", "WTFPL", "X11", "Zlib",
+    ]
+}
+
+
 def license_family_from_text(text: str) -> str | None:
-    """Classify a LICENSE document into a comparable family, or None."""
+    """Classify a LICENSE document into a comparable family, or None.
+
+    An explicit standard-license marker always wins; the "All rights reserved"
+    phrase (common boilerplate inside MIT/Apache files) is only consulted when
+    no standard header is present.
+    """
     t = text.lower()
+    for fam, pat in _STANDARD_MARKERS:
+        if re.search(pat, t):
+            return fam
     if "all rights reserved" in t or "保留所有权利" in text:
         return "arr"
-    if "apache" in t and re.search(r"apache\s+license", t):
-        return "apache-2.0"
-    if ("creative commons" in t and "attribution" in t) or "cc-by-4.0" in t:
-        return "cc-by-4.0"
-    if re.search(r"\bmit license\b", t) or re.search(r"^\s*mit\s*$", t):
-        return "mit"
     return None
 
 
 def license_family_from_spdx(expr: str) -> str | None:
-    s = expr.strip().strip('"').lower()
-    if "allrightsreserved" in s or "all-rights-reserved" in s:
-        return "arr"
-    if "cc-by-4.0" in s or "cc-by-4" in s:
-        return "cc-by-4.0"
-    if "apache-2.0" in s:
-        return "apache-2.0"
-    if s == "mit" or "mit" in re.split(r"[\s()+&]", s):
-        return "mit"
+    """Map a CITATION.cff `license:` SPDX expression to a family.
+
+    Returns 'multi' for an OR/AND expression spanning >1 family (ambiguous: the
+    gate must not silently collapse it), else the single family or None.
+    """
+    parts = re.split(r"\s+(?:OR|AND)\s+", expr.strip().strip('"'), flags=re.I)
+    fams: set[str] = set()
+    for p in parts:
+        pl = p.strip().strip("()").lower()
+        if not pl:
+            continue
+        if "allrightsreserved" in pl or "all rights reserved" in pl or pl == "arr":
+            fams.add("arr")
+        elif pl.startswith("licenseref-"):
+            fams.add(f"?{pl}")
+        elif pl in {"none", "noassertion"}:
+            fams.add(f"?{pl}")
+        else:
+            got = next((f for f, pat in _STANDARD_MARKERS
+                        if re.search(pat, pl) or pl == f or pl.startswith(f + "-")), None)
+            fams.add(got or f"?{pl}")
+    if len(fams) == 1:
+        return next(iter(fams))
+    if len(fams) > 1:
+        return "multi"
     return None
 
 
@@ -246,22 +355,41 @@ def check_license_sync(root: Path, rep: Report) -> None:
     if not lic.is_file() or not cff.is_file():
         rep.skip("license sync not applicable (LICENSE or CITATION.cff absent)")
         return
+    text = cff.read_text(encoding="utf-8")
+    expr, status = cff_value_status(text, "license")
     fam_lic = license_family_from_text(lic.read_text(encoding="utf-8"))
-    expr, status = cff_value_status(cff.read_text(encoding="utf-8"), "license")
     if status == "missing":
-        rep.bad("CITATION.cff has no `license:` field — machine-readable "
-                "metadata must state the license (or its absence) explicitly")
+        url = cff_value_status(text, "license-url")[0]
+        if url:
+            rep.ok("license declared by URL only (license-url) — correct CFF 1.2.0 "
+                   "fallback when the license is not an SPDX enum id")
+        else:
+            rep.bad("CITATION.cff declares neither `license:` nor `license-url:` — "
+                    "machine-readable metadata must state the license")
         return
     if status == "empty":
         rep.bad("CITATION.cff `license:` is empty")
         return
-    fam_cff = license_family_from_spdx(expr or "")
+    assert expr is not None
+    _tokens = re.split(r"\s+(?:OR|AND)\s+", expr.strip().strip('"'), flags=re.I)
+    if not all(t.strip().strip("()").lower() in _CFF_ENUM for t in _tokens):
+        rep.bad(f"CITATION.cff license {expr!r} is not a valid CFF 1.2.0 value "
+                "(strict SPDX enum; LicenseRef-*, free text and 'All Rights "
+                "Reserved' are NOT members); omit `license:` and use "
+                "`license-url:` instead")
+        return
+    fam_cff = license_family_from_spdx(expr)
     if fam_lic is None:
         rep.bad("LICENSE family unrecognized — add a recognizable marker "
                 "(All Rights Reserved / Apache 2.0 / MIT / Creative Commons)")
         return
-    if fam_cff is None:
-        rep.bad(f"CITATION.cff license {expr!r} does not map to a known family")
+    if fam_cff == "multi":
+        rep.bad(f"CITATION.cff license {expr!r} spans multiple families — "
+                "ambiguous, resolve to a single SPDX expression")
+        return
+    if fam_cff is None or (fam_cff or "").startswith("?"):
+        rep.bad(f"CITATION.cff license {expr!r} is not a CFF 1.2.0 enum value "
+                "(LicenseRef-*/free text are not enum ids); use `license-url:` instead")
         return
     if fam_lic == fam_cff:
         rep.ok(f"license family consistent: {fam_lic} "
@@ -480,10 +608,50 @@ BROKEN_CASES = [
      {}, "LICENSE METADATA CONFLICT"),
     ("license field dropped from CITATION",
      {"CITATION.cff": GOOD_FIXTURE["CITATION.cff"].replace("license: MIT\n", "")},
-     {}, "no `license:` field"),
+     {}, "neither `license:` nor `license-url:`"),
     ("LICENSE reserves all rights while CITATION grants CC-BY-4.0",
      {"LICENSE": "Copyright (c) 2026 X\n\nAll Rights Reserved.\n"},
      {}, "LICENSE METADATA CONFLICT"),
+    # --- round-3: findings from the independent license/IP auditor ---
+    # a CITATION `license:` value outside the CFF 1.2.0 enum (LicenseRef-*) is
+    # invalid machine metadata, even though it is valid SPDX syntax
+    ("CITATION license is a LicenseRef (not a CFF enum id)",
+     {"CITATION.cff": GOOD_FIXTURE["CITATION.cff"].replace(
+         "license: MIT", "license: LicenseRef-AllRightsReserved")},
+     {}, "CFF 1.2.0"),
+    # an MIT LICENSE whose boilerplate says \"All rights reserved\" must be read
+    # as MIT, so a CITATION claiming CC-BY-4.0 is a genuine conflict
+    ("MIT LICENSE with ARR boilerplate must not be misread as ARR",
+     {"LICENSE": "MIT License\n\nCopyright (c) 2026 X. All rights reserved.\n",
+      "CITATION.cff": GOOD_FIXTURE["CITATION.cff"].replace("license: MIT",
+                                                           "license: CC-BY-4.0")},
+     {}, "LICENSE METADATA CONFLICT"),
+    # an ambiguous OR expression spanning two families must be rejected
+    ("ambiguous OR license expression",
+     {"CITATION.cff": GOOD_FIXTURE["CITATION.cff"].replace(
+         "license: MIT", "license: MIT OR CC-BY-4.0")},
+     {}, "spans multiple families"),
+    # PROBE B (red-team round 2): a spacing-less heading `##[v0.2.1]` must still
+    # be parsed — otherwise the version check fail-opens to SKIP
+    ("spacing-less CHANGELOG heading must not fail-open to SKIP",
+     {"CITATION.cff": GOOD_FIXTURE["CITATION.cff"].replace('"0.2.1"', '"0.1.0"'),
+      "CHANGELOG.md": "# Changelog\n\n##[v0.2.1] — 2026-09-28\n- latest\n"},
+     {}, "version"),
+]
+
+# fixture variants that MUST pass (positive controls — a gate that always reds is
+# as useless as one that never reds)
+GOOD_VARIANTS = [
+    ("license declared by URL only (no enum id) — the CFF-sanctioned fallback",
+     {"CITATION.cff": GOOD_FIXTURE["CITATION.cff"].replace(
+         "license: MIT\n", "license-url: \"https://example.invalid/LICENSE\"\n")}),
+    ("MIT LICENSE with ARR boilerplate + CITATION MIT (must NOT false-red)",
+     {"LICENSE": "MIT License\n\nCopyright (c) 2026 X. All rights reserved.\n"}),
+    # PROBE C (red-team round 2): a version-looking heading inside a code fence
+    # is documentation, not a release — treating it as one is a false red
+    ("version-looking heading inside a code fence must NOT be read as a release",
+     {"CHANGELOG.md": "# Changelog\n\n## [0.2.1] — 2026-09-28\n- latest\n\n"
+                       "```\n## v9.9.9\n```\n"}),
 ]
 
 
@@ -532,6 +700,41 @@ def selftest() -> int:
             print(f"  FAIL  broken fixture NOT rejected ({label}) — gate is decorative")
             rc = 1
         shutil.rmtree(bad, ignore_errors=True)
+
+    for label, mutations in GOOD_VARIANTS:
+        okv = build_fixture(mutations)
+        rep = run_checks(okv, repo=None, expect_tag="v0.2.1")
+        if not rep.failed:
+            print(f"  PASS  good variant accepted: {label}")
+        else:
+            print(f"  FAIL  good variant FALSELY rejected ({label}) — gate over-reds")
+            rc = 1
+        shutil.rmtree(okv, ignore_errors=True)
+
+    # N6 (red-team round 2): escape-and-return `../<this-repo>/docs/details.md`
+    # resolves back inside the tree yet is a dead link on GitHub. Needs the
+    # dynamic fixture name, so it is built here rather than in BROKEN_CASES.
+    n6 = build_fixture({})
+    (n6 / "README.md").write_text(
+        f"# T\n\nSee [SELF](../{n6.name}/docs/details.md).\n", encoding="utf-8")
+    rep = run_checks(n6, repo=None, expect_tag="v0.2.1")
+    if any("escapes the tree" in f for f in rep.failed):
+        print("  PASS  broken fixture rejected: N6 escape-and-return via ../<repo>/")
+    else:
+        print("  FAIL  broken fixture NOT rejected (N6 escape-and-return) — gate is decorative")
+        rc = 1
+    shutil.rmtree(n6, ignore_errors=True)
+
+    # case-only mismatch must red on every host (Windows/macOS are otherwise blind)
+    cm = build_fixture({})
+    (cm / "README.md").write_text("# T\n\nSee [U](DOCS/details.md).\n", encoding="utf-8")
+    rep = run_checks(cm, repo=None, expect_tag="v0.2.1")
+    if any("dead relative link" in f for f in rep.failed):
+        print("  PASS  broken fixture rejected: case-only path mismatch")
+    else:
+        print("  FAIL  broken fixture NOT rejected (case-only mismatch) — host-dependent")
+        rc = 1
+    shutil.rmtree(cm, ignore_errors=True)
 
     # pure-function logic, no network
     if version_has_tag(["v0.2.1", "v0.2.0"], "0.2.1") and not version_has_tag(
