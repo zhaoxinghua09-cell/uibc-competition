@@ -11,7 +11,12 @@ version: "0.1.0-dev"
 date-released: "2026-10-09"
 repository-code: "https://github.com/zhaoxinghua09-cell/uibc-competition"
 url: "https://github.com/zhaoxinghua09-cell/uibc-competition"
-license: LicenseRef-AllRightsReserved
+# `license:` is deliberately absent. CFF 1.2.0 requires it to be a strict SPDX
+# enum id, and `LicenseRef-*` / "All Rights Reserved" are not members, so the
+# spec's own fallback applies: state the terms by URL only. An earlier revision
+# carried `license: LicenseRef-AllRightsReserved`, which is not a legal value --
+# and the gate that was supposed to catch it printed the illegal string in a PASS
+# line, because that revision of the gate had no enum check. Both are fixed here.
 license-url: "https://github.com/zhaoxinghua09-cell/uibc-competition/blob/main/LICENSE"
 keywords:
   - UIBC
