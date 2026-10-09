@@ -1,0 +1,48 @@
+name: Bug report / 缺陷报告
+description: Something is wrong — a check passes when it should fail, a doc contradicts the code, a link is dead.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. This project treats a **failures that never surfaced** as the
+        most valuable kind of bug. Please be concrete: a claim without a reproduction is not yet
+        a report (see the project rules on evidence).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe? Paste the exact output, not a paraphrase.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Exact commands, file paths, versions. "It doesn't work" is not reproducible.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Tag (e.g. v0.2.1) or commit SHA you tested.
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and the CHANGELOG for this.
+          required: true
+        - label: I have not included secrets, tokens, or personal data in this report.
+          required: true

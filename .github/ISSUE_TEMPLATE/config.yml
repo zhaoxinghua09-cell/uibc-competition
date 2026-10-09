@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability / 安全漏洞
+    url: https://github.com/zhaoxinghua09-cell/.github/blob/main/SECURITY.md
+    about: Please report security issues privately, not as a public issue.
+  - name: Question / how to cite
+    url: https://github.com/zhaoxinghua09-cell
+    about: For citation and general questions, see the repository README and CITATION.cff.

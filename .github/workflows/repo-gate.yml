@@ -1,0 +1,41 @@
+# repo-gate —— 可失败的机器强制合并门禁（free-plan safe）
+# 背景：本仓此前没有任何"会失败"的版本一致性检查。catalogue/CITATION/tag 三者
+#       一旦漂移（实证：CITATION 0.1.2 而 CHANGELOG 最新发布条为 0.1.1），无门可查。
+# 三步：① selftest 负对照——每次运行自证"门能失败"；② 真检查——必备文件 /
+#       CITATION 键 / CITATION↔CHANGELOG 版本同步 / CHANGELOG 最新版有对应 git tag /
+#       相对链接可解析；③ 零外部 action 依赖（tarball API 取源，兼容 SHA-pinning）。
+name: repo-gate
+on:
+  pull_request:
+    branches: ["main", "master"]
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+jobs:
+  repo-gate:
+    name: repo-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: "Fetch source tarball (no actions/checkout; org SHA-pinning policy)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          curl -sSL --fail -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$REPO/tarball/$SHA" -o /tmp/src.tgz
+          mkdir -p /tmp/src && tar -xzf /tmp/src.tgz -C /tmp/src --strip-components=1
+          echo "source tree ready: $(find /tmp/src -type f | wc -l) files"
+
+      - name: "Selftest — prove the gate can fail (negative control)"
+        run: python3 /tmp/src/tools/repo_gate_check.py selftest
+
+      - name: "Real checks (files / citation / version sync / release tag / links)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 /tmp/src/tools/repo_gate_check.py check \
+            --root /tmp/src --repo "${{ github.repository }}"

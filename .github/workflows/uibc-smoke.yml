@@ -1,0 +1,36 @@
+# UIBC smoke · 端到端冒烟（注册/提交/评分/榜/验证 + 负向）
+#
+# 为什么存在：外部核验指出「功能已开启 ≠ 功能真正有效」。本工作流对线上赛事
+# API 做**只读优先**的端到端冒烟，必须能在服务退化时变红（负向探针 + 污染断言）。
+#
+# 三臂诚实声明：本 workflow 只跑 read-only 臂（--allow-reject-probes 关闭），
+# 绝不向生产榜写入。负向凭据探针需显式开启，且始终带 before/after 榜单总数断言。
+name: uibc-smoke
+on:
+  schedule:
+    - cron: "17 3 * * *"   # 每日 UTC 03:17
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: uibc-smoke (read-only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: "Fetch source tarball (no actions/checkout, org SHA-pinning policy)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          curl -sSL --fail -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$REPO/tarball/$SHA" -o /tmp/src.tgz
+          mkdir -p /tmp/src && tar -xzf /tmp/src.tgz -C /tmp/src --strip-components=1
+
+      - name: "Run smoke suite (read-only arm)"
+        run: python3 /tmp/src/tools/uibc_smoke.py --out /tmp/smoke.json
+
+      - name: "Upload result"
+        if: always()
+        run: cat /tmp/smoke.json 2>/dev/null || true
