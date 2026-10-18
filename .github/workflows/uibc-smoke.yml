@@ -11,6 +11,9 @@ on:
     - cron: "17 3 * * *"   # 每日 UTC 03:17
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   smoke:
     name: uibc-smoke (read-only)
