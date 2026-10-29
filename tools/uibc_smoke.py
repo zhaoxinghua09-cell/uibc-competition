@@ -236,12 +236,50 @@ def _find_schema_nodes(node, keys, path="$"):
     return out
 
 
+def _min_score_semantics(v) -> tuple[bool, str]:
+    """Semantic check for a min_score node's VALUE.
+
+    Accepts exactly two shapes:
+      a) a literal finite number (bool is NOT a number here);
+      b) a JSON-schema constraint node that declares a numeric type and/or a
+         minimum/exclusiveMinimum bound.
+    Anything else (string numbers, bools, prose dicts, bare "medal" objects)
+    cannot prove a threshold -> not schema-backed.
+    """
+    if isinstance(v, bool) or v is None:
+        return False, f"min_score value {v!r} is not numeric (bool/None rejected)"
+    if isinstance(v, (int, float)):
+        if math.isfinite(v):
+            return True, "literal finite number"
+        return False, "min_score is a non-finite number (NaN/Inf)"
+    if isinstance(v, dict):
+        t = v.get("type")
+        if t in ("number", "integer") or ("minimum" in v) or ("exclusiveMinimum" in v):
+            return True, f"schema constraint node (type={t!r}, minimum={v.get('minimum')!r})"
+        return False, (f"min_score node {json.dumps(v)[:80]} declares no numeric type "
+                       "or minimum bound — no threshold provable")
+    return False, f"min_score value has non-numeric type {type(v).__name__}"
+
+
+def _path_related_to_medal(path: str) -> bool:
+    """A min_score node only counts when its structural path runs through a
+    medal-rule subtree (e.g. $.properties.medal.min_score). A min_score in an
+    unrelated position (pagination, rate limits, ...) proves nothing about the
+    award rule."""
+    medal_keys = {"medal", "medals", "award", "awards", "bronze", "silver", "gold"}
+    segs = {s.lower() for s in path.replace("[", ".").replace("]", "").split(".")}
+    return bool(segs & medal_keys)
+
+
 def schema_medal_check(schema_body: str | None, medals) -> tuple[str, str]:
     """Cross-check /info's medal declaration against the formal /schema.
 
     Structural: locates actual medal/min_score nodes (path+type), never
-    substring matching. If the rule's meaning cannot be confirmed from the
-    schema structure, the verdict is UNVERIFIABLE — thresholds are never guessed.
+    substring matching. A PASS additionally requires the min_score node to be
+    (a) on a path related to the medal rule, and (b) semantically a real
+    threshold (finite number or numeric schema constraint). If the rule's
+    meaning cannot be confirmed from the schema structure, the verdict is
+    UNVERIFIABLE — thresholds are never guessed.
     """
     if schema_body is None:
         return "UNVERIFIABLE", "/schema unavailable — consistency with /info cannot be checked"
@@ -260,13 +298,25 @@ def schema_medal_check(schema_body: str | None, medals) -> tuple[str, str]:
     # a node only counts as threshold-bearing when it IS min_score or a dict
     # that CONTAINS a min_score key — a bare "medal" object (e.g. a JSON-schema
     # node describing a string) does not define the rule
-    threshold_nodes = [(p, v) for p, k, v in nodes
+    threshold_nodes = [(p, v if k == "min_score" else v.get("min_score"))
+                       for p, k, v in nodes
                        if k == "min_score"
                        or (isinstance(v, dict) and "min_score" in v)]
     if machine_declared:
+        proven = [(p, why) for p, v in threshold_nodes
+                  if _path_related_to_medal(p)
+                  for ok, why in [_min_score_semantics(v)] if ok]
+        if proven:
+            return "PASS", (f"/schema is schema-backed: medal-related min_score threshold with "
+                            f"provable semantics at {[p for p, _ in proven][:3]} "
+                            f"({proven[0][1]})")
         if threshold_nodes:
-            return "PASS", (f"/schema is schema-backed: min_score threshold structure "
-                            f"found at {[p for p, _ in threshold_nodes][:3]}")
+            detail = "; ".join(
+                f"{p} ({'unrelated path' if not _path_related_to_medal(p) else _min_score_semantics(v)[1]})"
+                for p, v in threshold_nodes[:3])
+            return "UNVERIFIABLE", (f"/schema has min_score nodes but none PROVABLE as the medal "
+                                    f"threshold: {detail} — the rule's meaning cannot be "
+                                    "confirmed; NOT reported as schema-backed")
         return "UNVERIFIABLE", (f"/schema mentions medal nodes {[p for p, _, _ in nodes][:3]} "
                                 "but none carries a min_score threshold structure — the rule's "
                                 "meaning cannot be confirmed; NOT reported as schema-backed")
@@ -306,8 +356,22 @@ def negative_credential_probe(res: Result, caller=call):
                 f"bogus token -> {st} (expected 4xx; 5xx/3xx/1xx are not rejections)")
 
 
+_CERT_SUBJECT_KEYS = ("owner", "agent_id", "subject", "agent")
+_CERT_ID_KEYS = ("cert_id", "certificate_id", "id")
+
+
 def _cert_verify_check(res: Result, cert_id: str, agent_id: str, caller=call):
-    """Cert verification with CONTENT consistency — HTTP 200 alone is not a pass."""
+    """Cert verification via STRUCTURED field matching — HTTP 200 alone is not
+    a pass, and neither is a substring hit.
+
+    Three-way identity check on the response body:
+      1. response cert id == the cert id requested (rounded trip);
+      2. a subject field (owner/agent_id/subject/agent) exists AND equals the
+         test agent id;
+      3. any mismatch is a FAIL (real evidence of a defect), any MISSING field
+         is UNVERIFIABLE (absence of evidence is not compliance).
+    Unrelated prose containing the agent id string does NOT confirm binding.
+    """
     st, body, _ = caller("GET", f"{V}/verify/{cert_id}")
     if unreachable(st):
         res.add("isolated: cert verify", "UNVERIFIABLE",
@@ -317,20 +381,47 @@ def _cert_verify_check(res: Result, cert_id: str, agent_id: str, caller=call):
         res.add("isolated: cert verify", "FAIL", f"GET /verify/{cert_id} -> {st}")
         return
     try:
-        cert_txt = json.dumps(json.loads(body), ensure_ascii=False)
+        cert = json.loads(body)
     except Exception:  # noqa: BLE001
         res.add("isolated: cert verify", "UNVERIFIABLE",
                 f"GET /verify/{cert_id} -> 200 but body unparseable — content "
                 "consistency cannot be checked; NOT reported as verified")
         return
-    if agent_id in cert_txt:
-        res.add("isolated: cert verify", "PASS",
-                f"cert {cert_id}: 200 AND content references test agent {agent_id}")
-    else:
+    if not isinstance(cert, dict):
         res.add("isolated: cert verify", "UNVERIFIABLE",
-                f"cert {cert_id}: 200 but content does not reference agent {agent_id} "
-                f"(body[:160]={cert_txt[:160]!r}) — consistency unconfirmed; "
-                "NOT reported as verified")
+                f"GET /verify/{cert_id} -> 200 but body is {type(cert).__name__}, "
+                "not an object — no structured fields to verify against")
+        return
+    resp_id = next((cert[k] for k in _CERT_ID_KEYS if cert.get(k) is not None), None)
+    subject_key = next((k for k in _CERT_SUBJECT_KEYS
+                        if cert.get(k) not in (None, "", False)), None)
+    subject = cert.get(subject_key) if subject_key else None
+    # --- identity 1: response cert id must round-trip
+    if resp_id is None:
+        res.add("isolated: cert verify", "UNVERIFIABLE",
+                f"cert body carries no cert id field {_CERT_ID_KEYS} — cannot "
+                "confirm the response cert is the requested one; NOT verified")
+        return
+    if str(resp_id) != str(cert_id):
+        res.add("isolated: cert verify", "FAIL",
+                f"cert id MISMATCH: requested {cert_id!r} but response declares "
+                f"{resp_id!r} — wrong certificate served")
+        return
+    # --- identity 2: subject binding (structured, not substring)
+    if subject_key is None:
+        res.add("isolated: cert verify", "UNVERIFIABLE",
+                f"cert {cert_id} round-trips (id matches) but carries no subject "
+                f"field {_CERT_SUBJECT_KEYS} (body keys: {sorted(cert)[:8]}) — "
+                "agent binding unproven; NOT verified")
+        return
+    if not isinstance(subject, str) or subject != agent_id:
+        res.add("isolated: cert verify", "FAIL",
+                f"cert {cert_id} SUBJECT MISMATCH: {subject_key}={subject!r} != "
+                f"test agent {agent_id!r} — certificate bound to another party")
+        return
+    res.add("isolated: cert verify", "PASS",
+            f"cert {cert_id}: 200, id round-trips, and {subject_key} is exactly "
+            f"the test agent {agent_id} (structured match, not substring)")
 
 
 def isolated_award_flow(res: Result, entry: dict | None,
@@ -406,7 +497,26 @@ def isolated_award_flow(res: Result, entry: dict | None,
         res.writes_confirmed_side_effects += 1
         medal_keys = [k for k in ("medal", "cert", "certificate", "cert_id")
                       if row.get(k) not in (None, "", False)]
-        best = float(row.get("best_total", -1))
+        # strict best_total parsing: a malformed value must be RECORDED, never
+        # crash the report — the try/finally pollution close-out still runs on
+        # every early return below
+        if "best_total" not in row:
+            res.add("isolated: award observation", "UNVERIFIABLE",
+                    f"board row for {agent_id} lacks best_total — award criterion "
+                    "unobservable (missing field is not a zero score); NOT guessed")
+            return
+        raw_best = row["best_total"]
+        try:
+            if isinstance(raw_best, bool) or not isinstance(raw_best, (int, float)):
+                raise TypeError(f"{raw_best!r} is {type(raw_best).__name__}, not a number")
+            best = float(raw_best)
+            if not math.isfinite(best):
+                raise ValueError(f"{raw_best!r} is not finite (NaN/Inf)")
+        except (TypeError, ValueError) as e:
+            res.add("isolated: award observation", "FAIL",
+                    f"MALFORMED best_total on board row: {e} — award criterion "
+                    "cannot be evaluated; recorded, not silently skipped")
+            return
         if best <= 0 and medal_keys:
             sample = {k: row.get(k) for k in medal_keys}
             res.add("isolated: award observation", "FAIL",

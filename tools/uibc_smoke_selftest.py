@@ -349,15 +349,17 @@ check("G7 zero-score+medal -> FAIL (real values, not literal comprehension)",
 check("G7 no literal '{k: row.get(k)...}' in detail",
       not any("row.get(k)" in r["detail"] for r in res.rows))
 
-# G8: cert verify — 200 body WITHOUT agent reference -> UNVERIFIABLE (not pass)
+# G8 (updated round-5): cert served for ANOTHER PARTY (structured field exists
+# but does not match) is positive evidence of a defect -> FAIL (round-4 treated
+# mere absence of reference as UNVERIFIABLE; a present-but-wrong binding is worse)
 res = smoke.Result()
 sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": 5.0,
                                "cert_id": "UIBC-MEM-0001"},
                cert=(200, '{"cert_id": "UIBC-MEM-0001", "owner": "someone-else"}'))
 smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
 g8 = rows_by_probe(res, "isolated: cert verify")
-check("G8 cert 200 without agent reference -> UNVERIFIABLE",
-      g8 and g8[0]["verdict"] == "UNVERIFIABLE", g8[0]["detail"][:70] if g8 else "")
+check("G8 cert bound to another subject -> FAIL (structured mismatch is evidence)",
+      g8 and g8[0]["verdict"] == "FAIL", g8[0]["detail"][:70] if g8 else "")
 
 # G9: cert verify — 200 body WITH agent reference -> PASS
 res = smoke.Result()
@@ -412,6 +414,109 @@ check("H5 schema unavailable -> UNVERIFIABLE", v == "UNVERIFIABLE")
 schema_trap = {"note_min_score_x": 1}
 v, d = smoke.schema_medal_check(json.dumps(schema_trap), GOOD_SPEC)
 check("H6 lookalike key is NOT matched (exact key match only)", v == "WARN", d[:70])
+
+# ------------------------------------------------- I. round-5 targeted regressions
+print("I. round-5 regressions — schema path+semantics, cert 3-way identity, best_total hardening")
+
+# ---- I1-I6: schema_medal_check — path relation + threshold semantics
+print("I.a schema_medal_check: medal-related path AND provable threshold semantics")
+sc_good = {"properties": {"medal": {"min_score": 1}}}
+v, d = smoke.schema_medal_check(json.dumps(sc_good), GOOD_SPEC)
+check("I1 medal-path + literal finite number -> PASS", v == "PASS", d[:70])
+
+sc_unrelated = {"properties": {"pagination": {"min_score": 1}}}
+v, d = smoke.schema_medal_check(json.dumps(sc_unrelated), GOOD_SPEC)
+check("I2 min_score in UNRELATED path -> UNVERIFIABLE (was false PASS)",
+      v == "UNVERIFIABLE", d[:80])
+
+sc_constraint = {"properties": {"medal": {"min_score": {"type": "number", "minimum": 1}}}}
+v, d = smoke.schema_medal_check(json.dumps(sc_constraint), GOOD_SPEC)
+check("I3 schema-constraint node (type=number+minimum) -> PASS", v == "PASS", d[:70])
+
+sc_bare_desc = {"properties": {"medal": {"min_score": {"description": "the floor"}}}}
+v, d = smoke.schema_medal_check(json.dumps(sc_bare_desc), GOOD_SPEC)
+check("I4 min_score node without numeric constraint -> UNVERIFIABLE",
+      v == "UNVERIFIABLE", d[:70])
+
+sc_str_num = {"properties": {"medal": {"min_score": "1"}}}
+v, d = smoke.schema_medal_check(json.dumps(sc_str_num), GOOD_SPEC)
+check("I5 string-number min_score -> UNVERIFIABLE (no type coercion)",
+      v == "UNVERIFIABLE", d[:70])
+
+sc_nan = json.loads(json.dumps({"properties": {"medal": {"min_score": float("nan")}}}))
+v, d = smoke.schema_medal_check(json.dumps(sc_nan), GOOD_SPEC)
+check("I6 NaN min_score -> UNVERIFIABLE (non-finite)", v == "UNVERIFIABLE", d[:70])
+
+# ---- I7-I12: _cert_verify_check — structured 3-way identity
+print("I.b cert verify: request-id round-trip x subject binding, never substring")
+TA_ID = TA["agent_id"]
+
+
+def run_cert(body):
+    r = smoke.Result()
+
+    class OneShot:
+        def __call__(self, method, path, payload=None, timeout=25):
+            return (200, json.dumps(body), {})
+
+    smoke._cert_verify_check(r, "C1", TA_ID, caller=OneShot())
+    return rows_by_probe(r, "cert verify")
+
+
+rows = run_cert({"cert_id": "C1", "owner": TA_ID})
+check("I7 id round-trip + exact owner match -> PASS",
+      rows and rows[0]["verdict"] == "PASS", rows[0]["detail"][:70] if rows else "")
+rows = run_cert({"cert_id": "C1", "owner": "someone-else"})
+check("I8 subject MISMATCH -> FAIL (was UNVERIFIABLE pre-round-5)",
+      rows and rows[0]["verdict"] == "FAIL", rows[0]["detail"][:70] if rows else "")
+rows = run_cert({"cert_id": "OTHER-CERT", "owner": TA_ID})
+check("I9 response cert id != requested -> FAIL (wrong cert served)",
+      rows and rows[0]["verdict"] == "FAIL", rows[0]["detail"][:70] if rows else "")
+rows = run_cert({"cert_id": "C1"})
+check("I10 id matches but no subject field -> UNVERIFIABLE",
+      rows and rows[0]["verdict"] == "UNVERIFIABLE", rows[0]["detail"][:70] if rows else "")
+rows = run_cert({"cert_id": "C1", "note": f"hello {TA_ID} world"})
+check("I11 substring-only mention of agent -> UNVERIFIABLE (substring trap removed)",
+      rows and rows[0]["verdict"] == "UNVERIFIABLE", rows[0]["detail"][:70] if rows else "")
+rows = run_cert(["C1", TA_ID])
+check("I12 non-object body (list) -> UNVERIFIABLE",
+      rows and rows[0]["verdict"] == "UNVERIFIABLE", rows[0]["detail"][:70] if rows else "")
+
+# ---- I13-I16: isolated_award_flow — best_total hardening, report must survive
+print("I.c best_total: malformed values recorded as FAIL, report + pollution intact")
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": "high",
+                               "medal": "gold"})
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+obs = rows_by_probe(res, "award observation")
+check("I13 string best_total -> FAIL (recorded, not crashed)",
+      obs and obs[0]["verdict"] == "FAIL" and "MALFORMED" in obs[0]["detail"],
+      obs[0]["detail"][:70] if obs else "no row")
+check("I13 pollution close-out still ran after malformed-data return",
+      len(rows_by_probe(res, "deep pollution")) == 1)
+
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": True})
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+obs = rows_by_probe(res, "award observation")
+check("I14 bool best_total -> FAIL (bool is not a number here)",
+      obs and obs[0]["verdict"] == "FAIL", obs[0]["detail"][:70] if obs else "no row")
+
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"]})
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+obs = rows_by_probe(res, "award observation")
+check("I15 missing best_total -> UNVERIFIABLE (absence is not zero)",
+      obs and obs[0]["verdict"] == "UNVERIFIABLE", obs[0]["detail"][:70] if obs else "no row")
+check("I15 pollution close-out still ran", len(rows_by_probe(res, "deep pollution")) == 1)
+
+res = smoke.Result()
+nan_row = json.loads(json.dumps({"agent_id": TA["agent_id"], "best_total": float("nan")}))
+sc = flow_stub(spec_board_row=nan_row)
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+obs = rows_by_probe(res, "award observation")
+check("I16 NaN best_total -> FAIL (non-finite)", obs and obs[0]["verdict"] == "FAIL",
+      obs[0]["detail"][:70] if obs else "no row")
 
 # ----------------------------------------------------------------------------
 print(f"\n{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else " — all negative controls hold"))
