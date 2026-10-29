@@ -104,9 +104,24 @@ def run(allow_reject: bool) -> Result:
             medals = info.get("medal", {})
             res.add("contract: GET /info", "PASS", f"200, {n_ep} endpoints declared, medal={medals}",
                     endpoints=sorted(info.get("endpoints", {}).keys()))
-            res.add("observability: medal threshold for score 0", "OBSERVE",
-                    f"bronze spec = {medals.get('bronze')!r} -> does a 0-score entry get a medal? "
-                    "(criterion: 0 must get NO medal)")
+            # Negative control for the medal spec: a declared bronze spec that has no
+            # explicit minimum-score floor (e.g. "其余"/"others") grants a medal to a
+            # 0-score entrant by construction. Criterion says 0 must get NO medal, so
+            # such a spec is a FAIL until the service declares an explicit floor.
+            bronze_spec = medals.get("bronze")
+            floor_declared = any(
+                tok in str(bronze_spec) for tok in (">0", "> 0", ">=1", ">= 1", "min")
+            ) and "其余" not in str(bronze_spec) and "others" not in str(bronze_spec).lower()
+            if bronze_spec is None:
+                res.add("medal-spec: zero-score exclusion declared", "OBSERVE",
+                        "no bronze spec declared in /info — verify manually")
+            elif floor_declared:
+                res.add("medal-spec: zero-score exclusion declared", "PASS",
+                        f"bronze spec = {bronze_spec!r} declares a minimum-score floor")
+            else:
+                res.add("medal-spec: zero-score exclusion declared", "FAIL",
+                        f"bronze spec = {bronze_spec!r} has NO minimum-score floor -> a 0-score "
+                        "entrant is granted bronze by construction (criterion: 0 must get NO medal)")
         except Exception as e:  # noqa: BLE001
             res.add("contract: GET /info", "FAIL", f"200 but unparseable: {e}")
     else:
@@ -155,11 +170,18 @@ def run(allow_reject: bool) -> Result:
         res.add("verify: fake cert (negative)", "FAIL", f"expected 404, got {st}")
 
     # ---- 5. route existence for write endpoints (OPTIONS only; never POST)
+    # A 5xx on OPTIONS is a real server defect (route exists but handler/capacity
+    # is broken): it must FAIL the run, not pass as WARN. Previously 500s were
+    # recorded as WARN, which let a "14 probes passed, 0 FAIL" verdict coexist
+    # with three 500 responses in the same run (observed 2026-10-29, Run 40854189959).
     for ep in WRITE_ENDPOINTS:
         st, body, hdrs = call("OPTIONS", f"{V}/{ep}")
-        ok = st in (200, 204, 405)
-        res.add(f"route: OPTIONS /{ep}", "PASS" if ok else "WARN",
-                f"{st} (allow={hdrs.get('Allow', hdrs.get('allow',''))})")
+        if st in (200, 204, 405):
+            res.add(f"route: OPTIONS /{ep}", "PASS", f"{st} (allow={hdrs.get('Allow', hdrs.get('allow',''))})")
+        elif st >= 500:
+            res.add(f"route: OPTIONS /{ep}", "FAIL", f"{st} — server error on preflight (intermittent if transient)")
+        else:
+            res.add(f"route: OPTIONS /{ep}", "WARN", f"{st} (allow={hdrs.get('Allow', hdrs.get('allow',''))})")
 
     # ---- 6. negative credential probe (fail-fast; opt-in)
     if allow_reject:
