@@ -248,6 +248,8 @@ def _min_score_semantics(v) -> tuple[bool, str]:
          the bound must be finite and > 0 (minimum=0 or a negative bound
          cannot exclude a 0-score medal, and an invalid bound value — string,
          bool, null, NaN — proves nothing).
+    Returns (proven, why); when proven, `why` embeds the bound's value and
+    comparison operator for cross-source matching.
     Anything less -> not provable -> UNVERIFIABLE upstream.
     """
     if isinstance(v, bool) or v is None:
@@ -280,6 +282,38 @@ def _min_score_semantics(v) -> tuple[bool, str]:
     return False, f"min_score value has non-numeric type {type(v).__name__}"
 
 
+def _min_score_bound(v) -> list[tuple[str, float]]:
+    """(comparison_op, value) pairs declared by a SEMANTICALLY PROVEN min_score
+    node (call only after _min_score_semantics returned True). A literal node
+    means the field itself is the floor: score >= value. minimum -> >=,
+    exclusiveMinimum -> >."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return [(">=", float(v))]
+    if isinstance(v, dict):
+        out = []
+        for key in ("minimum", "exclusiveMinimum"):
+            if key in v:
+                out.append((">=" if key == "minimum" else ">", float(v[key])))
+        return out
+    return []
+
+
+def _bronze_floor_semantics(bronze_spec) -> tuple[float | None, str | None]:
+    """(value, comparison_op) of the /info-declared machine-readable floor.
+    Reuses _parse_bronze_floor as the single source of parseability truth;
+    dict bronze.min_score carries "score >= min_score" semantics (see its
+    docstring), a string spec carries its own explicit >=/ > operator."""
+    _, ok, _ = _parse_bronze_floor(bronze_spec)
+    if not ok:
+        return None, None
+    if isinstance(bronze_spec, dict):
+        return float(bronze_spec["min_score"]), ">="
+    m = re.fullmatch(r"(>=?)\s*(\d+(?:\.\d+)?)", bronze_spec.strip())
+    if not m:
+        return None, None
+    return float(m.group(2)), m.group(1)
+
+
 def _path_related_to_medal(path: str) -> bool:
     """A min_score node only counts when its structural path runs through a
     medal-rule subtree (e.g. $.properties.medal.min_score). A min_score in an
@@ -294,11 +328,16 @@ def schema_medal_check(schema_body: str | None, medals) -> tuple[str, str]:
     """Cross-check /info's medal declaration against the formal /schema.
 
     Structural: locates actual medal/min_score nodes (path+type), never
-    substring matching. A PASS additionally requires the min_score node to be
-    (a) on a path related to the medal rule, and (b) semantically a real
-    threshold (finite number or numeric schema constraint). If the rule's
-    meaning cannot be confirmed from the schema structure, the verdict is
-    UNVERIFIABLE — thresholds are never guessed.
+    substring matching. A PASS requires ALL of:
+      (a) the min_score node is on a path related to the medal rule;
+      (b) the node semantically PROVES a threshold (value + comparison
+          semantics that exclude a 0-score entrant);
+      (c) the proven bound MATCHES the /info-declared floor in BOTH value and
+          comparison operator — "a valid threshold exists in the schema" and
+          "the two sources declare the SAME threshold" are different claims;
+          only (c) earns the word "consistent".
+    Mismatch between the two sources is positive evidence of a defect -> FAIL.
+    Anything unprovable -> UNVERIFIABLE — thresholds are never guessed.
     """
     if schema_body is None:
         return "UNVERIFIABLE", "/schema unavailable — consistency with /info cannot be checked"
@@ -322,13 +361,26 @@ def schema_medal_check(schema_body: str | None, medals) -> tuple[str, str]:
                        if k == "min_score"
                        or (isinstance(v, dict) and "min_score" in v)]
     if machine_declared:
-        proven = [(p, why) for p, v in threshold_nodes
-                  if _path_related_to_medal(p)
-                  for ok, why in [_min_score_semantics(v)] if ok]
+        info_val, info_op = _bronze_floor_semantics(medals.get("bronze"))
+        proven = []
+        for p, v in threshold_nodes:
+            if not _path_related_to_medal(p):
+                continue
+            ok, why = _min_score_semantics(v)
+            if ok:
+                proven.append((p, _min_score_bound(v), why))
+        matching = [(p, b, why) for p, b, why in proven
+                    if any(op == info_op and val == info_val for op, val in b)]
+        if matching:
+            return "PASS", (f"/schema threshold at {[p for p, _, _ in matching][:3]} MATCHES the "
+                            f"/info declared floor ({info_op} {info_val}): value AND comparison "
+                            f"semantics agree ({matching[0][2]})")
         if proven:
-            return "PASS", (f"/schema is schema-backed: medal-related min_score threshold with "
-                            f"provable semantics at {[p for p, _ in proven][:3]} "
-                            f"({proven[0][1]})")
+            detail = "; ".join(f"{p} declares {b}" for p, b, _ in proven[:3])
+            return "FAIL", (f"CROSS-SOURCE MISMATCH: /info declares bronze floor {info_op} "
+                            f"{info_val} but the schema's medal-related threshold(s) disagree: "
+                            f"{detail} — 'a valid threshold exists' is NOT 'the two sources "
+                            "declare the same threshold'")
         if threshold_nodes:
             detail = "; ".join(
                 f"{p} ({'unrelated path' if not _path_related_to_medal(p) else _min_score_semantics(v)[1]})"

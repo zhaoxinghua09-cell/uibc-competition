@@ -545,18 +545,36 @@ v, d = schema_check_of({"type": "number", "minimum": True})
 check("J5 minimum as BOOL -> UNVERIFIABLE (invalid constraint value)",
       v == "UNVERIFIABLE", d[:80])
 v, d = schema_check_of({"type": "number", "exclusiveMinimum": 1})
-check("J6 exclusiveMinimum=1 -> PASS (bound + '>' comparison semantics proven)",
-      v == "PASS", d[:80])
+check("J6 exclusiveMinimum=1 vs /info '>=' 1 -> FAIL (comparison-direction mismatch)",
+      v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:90])
 v, d = schema_check_of(0)
 check("J7 literal threshold 0 -> UNVERIFIABLE (cannot exclude 0-score)",
       v == "UNVERIFIABLE", d[:80])
 v, d = schema_check_of({"type": "integer", "minimum": 2.5})
-check("J8 minimum=2.5 >0 -> PASS (finite positive bound)", v == "PASS", d[:80])
-# end-to-end negative: threshold in schema WEAKER than /info floor must not PASS
+check("J8 minimum=2.5 vs /info floor 1 -> FAIL (threshold VALUE mismatch)",
+      v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:90])
+# J9 = the exact cross-source counterexample from external review:
+# /info declares floor 1, schema declares minimum 0.5 -> must NOT report agreement
 v, d = schema_check_of({"type": "number", "minimum": 0.5})
-check("J9 sanity: any positive bound proves schema-backed structure (value "
-      "cross-check vs /info floor is server-side territory, recorded in detail)",
-      v == "PASS" and "minimum=0.5" in d, d[:90])
+check("J9 /info floor=1 vs schema minimum=0.5 -> FAIL (cross-source mismatch, "
+      "was false PASS 'schema-backed')",
+      v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:90])
+v, d = schema_check_of({"type": "number", "minimum": 1})
+check("J10 /info floor=1 AND schema minimum=1 -> PASS (same value AND same "
+      "comparison semantics — consistency proven)",
+      v == "PASS" and "MATCHES" in d, d[:90])
+v, d = smoke.schema_medal_check(
+    json.dumps({"properties": {"medal": {"min_score": {"type": "number",
+                                                       "minimum": 1}}}}),
+    {"bronze": ">1"})
+check("J11 /info '>1' vs schema minimum=1 -> FAIL (op mismatch: >= is not >)",
+      v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:90])
+v, d = smoke.schema_medal_check(
+    json.dumps({"properties": {"medal": {"min_score": {"type": "number",
+                                                       "exclusiveMinimum": 0}}}}),
+    {"bronze": ">0"})
+check("J12 schema bound 0 (cannot exclude 0-score) with /info '>0' -> UNVERIFIABLE",
+      v == "UNVERIFIABLE", d[:90])
 
 # ----------------------------------------------------------------------------
 print(f"\n{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else " — all negative controls hold"))
