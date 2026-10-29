@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """uibc_smoke_selftest — OFFLINE negative controls for uibc_smoke.
 
-Proves each new detection capability can actually FAIL (a test that cannot
-fail proves nothing). No network I/O: server interaction is stubbed.
+Proves each detection capability can actually FAIL (a test that cannot fail
+proves nothing). No external network: server interaction is stubbed; the one
+runtime drill binds to a local logging server on 127.0.0.1.
 
-Covers (review round 3):
-  A. medal-spec parser: NaN / Infinity / -Infinity / negative / zero / bool /
-     string-number / missing field / prose / wrong type -> all FAIL.
-  B. deep-pollution compare: unavailable snapshot (None) -> UNVERIFIABLE
-     (never PASS); identical -> PASS; changed -> FAIL.
-  C. write accounting: attempted POST is never reported as zero writes;
-     unreachable POST counts as attempted but not responded.
-  D. abnormal success: a 2xx on an invalid-credential POST is an immediate
-     FAIL and increments confirmed_side_effects.
+Sections:
+  A. medal-spec parser: prose/missing/wrong-type/NaN/Inf/bool/str-number -> FAIL
+  B. deep-pollution compare: None -> UNVERIFIABLE (never PASS); changed -> FAIL
+  C. write accounting: a sent POST is never reported as zero writes
+  D. abnormal success: 2xx on bogus token -> FAIL + possible side effect
+  E. guard inputs (offline layers)
+  F. runtime drill: zero-POST guarantee via local logging server
+  G. isolated award flow (stubbed): every write path runs the pollution
+     close-out (try/finally); zero-score-without-medal is NEVER a bare PASS
+     (regression control for the false-PASS defect); cert verify checks
+     content, not just HTTP 200; possible vs confirmed side effects
+  H. schema medal check: structural node lookup, substring trap, UNVERIFIABLE
+     when the rule's meaning cannot be confirmed
 
 Exit 0 = all negative controls hold; non-zero = the smoke has gone decorative.
 """
@@ -39,28 +44,75 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
+def rows_by_probe(res, needle):
+    return [r for r in res.rows if needle in r["probe"]]
+
+
+class StubCaller:
+    """Scripted call() replacement: pops (status, body) per invocation."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.methods = []
+
+    def __call__(self, method, path, body=None, timeout=25):
+        self.methods.append((method, path))
+        st, b = self.responses.pop(0)
+        return st, b, {}
+
+
+def flow_stub(spec_board_row=None, join=(200, "{}"), submit=(200, "{}"),
+              board=(200, '{"leaderboard": []}'), cert=None):
+    """Build a StubCaller sequence for isolated_award_flow.
+    Actual call order in isolated_award_flow:
+    1. snapshot_state (before)          -> snap
+    2. POST /join                       -> join
+    3. POST /submit                     -> submit
+    4. GET /leaderboard (row lookup)    -> board / spec_board_row
+    5. GET /verify/{cert_id} (optional) -> cert
+    6. snapshot_state (after, finally)  -> snap (last, ALWAYS)
+    """
+    seq = []
+    snap = (200, json.dumps({"total_agents": 36, "leaderboard": [
+        {"agent_id": "x", "best_total": 1.0}]}))
+    seq.append(snap)          # 1: before-snapshot
+    seq.append(join)          # 2: POST /join
+    seq.append(submit)        # 3: POST /submit
+    if spec_board_row is not None:
+        seq.append((200, json.dumps({"leaderboard": [spec_board_row]})))
+    else:
+        seq.append(board)
+    if cert is not None:
+        seq.append(cert)
+    seq.append(snap)          # 6: after-snapshot (finally, always last)
+    return StubCaller(seq)
+
+
+TA = {"agent_id": "uibc-mem-2026-test0", "token": "t",
+      "join_payload": {"a": 1}, "submit_payload": {"b": 2}}
+ENTRY = {"base": "http://127.0.0.1:1", "test_agent": TA}
+
 # ---------------------------------------------------------------- A. parser
 print("A. medal-spec parser (negative controls: bad specs must be rejected)")
 cases = [
     ("其余", False), ("others", False), (None, False), ("", False),
     (">0", True), ("> 0", True), (">0.5", True), (">=1", True), (">= 1", True), (">=0.5", True),
-    (">=0", False), (">=0.0", False),  # >=0 admits a 0-score entrant
+    (">=0", False), (">=0.0", False),
     (">-1", False), (">=-1", False),
-    (">=x", False), (">min", False), (">= 1 (bronze)", False),  # prose
+    (">=x", False), (">min", False), (">= 1 (bronze)", False),
     ({"min_score": 1}, True), ({"min_score": 10}, True), ({"min_score": 0.5}, True),
     ({"min_score": 0}, False), ({"min_score": -3}, False),
-    ({"min_score": "1"}, False),          # string-encoded number
-    ({"min_score": True}, False),         # bool is not a score
-    ({"min_score": None}, False),         # missing value
-    ({"minimum": 1}, False),              # differently-named field (old 'min' bug)
-    ({}, False),                          # missing min_score entirely
+    ({"min_score": "1"}, False),
+    ({"min_score": True}, False),
+    ({"min_score": None}, False),
+    ({"minimum": 1}, False),
+    ({}, False),
     (["min"], False), (3, False),
 ]
 for spec, want in cases:
     _, ok, why = smoke._parse_bronze_floor(spec)
     check(f"parse {spec!r} -> {'PASS' if want else 'FAIL'}", ok == want, why[:70])
-special = [float("nan"), float("inf"), float("-inf")]
-for v in special:
+for v in (float("nan"), float("inf"), float("-inf")):
     _, ok, why = smoke._parse_bronze_floor({"min_score": v})
     check(f"parse min_score={v!r} -> FAIL (non-finite)", ok is False, why[:70])
 
@@ -68,20 +120,20 @@ for v in special:
 print("B. deep-pollution compare (negative control: None must never PASS)")
 same = {"total_agents": 36, "row_count": 36, "rows_sha256": "a" * 64}
 v1, d1 = smoke.compare_states(same, dict(same))
-check("identical snapshots -> PASS", v1 == "PASS", d1[:60])
+check("identical snapshots -> PASS (scope-limited wording)",
+      v1 == "PASS" and "NOT a DB-wide proof" in d1, d1[:70])
 v2, d2 = smoke.compare_states(None, same)
-check("before=None -> UNVERIFIABLE/FAIL", v2 in ("UNVERIFIABLE", "FAIL"), d2[:60])
+check("before=None -> UNVERIFIABLE", v2 == "UNVERIFIABLE", d2[:60])
 v3, d3 = smoke.compare_states(same, None)
-check("after=None -> UNVERIFIABLE/FAIL", v3 in ("UNVERIFIABLE", "FAIL"), d3[:60])
+check("after=None -> UNVERIFIABLE", v3 == "UNVERIFIABLE", d3[:60])
 v4, d4 = smoke.compare_states(None, None)
-check("both=None (full outage) -> UNVERIFIABLE/FAIL", v4 in ("UNVERIFIABLE", "FAIL"), d4[:60])
+check("both=None (full outage) -> UNVERIFIABLE", v4 == "UNVERIFIABLE", d4[:60])
 diff = dict(same, total_agents=37)
 v5, d5 = smoke.compare_states(same, diff)
 check("changed snapshot -> FAIL", v5 == "FAIL", d5[:60])
 
 # --------------------------- C+D. write accounting & abnormal success (stubbed)
 print("C. write accounting (a sent POST is never reported as zero writes)")
-# stub: unreachable (no HTTP response)
 res = smoke.Result()
 calls = []
 
@@ -92,12 +144,12 @@ def stub_unreachable(method, path, body=None, timeout=25):
 
 
 smoke.negative_credential_probe(res, caller=stub_unreachable)
-check("unreachable POST: attempted==1", res.writes_attempted == 1, str(res.write_counters()))
-check("unreachable POST: responded==0", res.writes_responses == 0)
+check("unreachable POST: attempted==1, responded==0",
+      res.writes_attempted == 1 and res.writes_responses == 0, str(res.write_counters()))
 check("unreachable POST: verdict FAIL", bool(res.failed))
 check("stub really sent a POST", calls and calls[0][0] == "POST")
 
-print("D. abnormal success (2xx on bogus token = FAIL + side effect)")
+print("D. abnormal success (2xx on bogus token = FAIL + possible side effect)")
 res2 = smoke.Result()
 
 
@@ -107,9 +159,10 @@ def stub_2xx(method, path, body=None, timeout=25):
 
 smoke.negative_credential_probe(res2, caller=stub_2xx)
 check("2xx bogus token -> FAIL", bool(res2.failed))
-check("2xx bogus token -> confirmed_side_effects==1",
-      res2.writes_side_effects == 1, str(res2.write_counters()))
-check("2xx bogus token -> responded==1", res2.writes_responses == 1)
+check("2xx bogus token -> possible_side_effects==1, confirmed==0 (2xx alone "
+      "does not confirm a DB change)",
+      res2.writes_possible_side_effects == 1 and res2.writes_confirmed_side_effects == 0,
+      str(res2.write_counters()))
 
 res3 = smoke.Result()
 
@@ -120,9 +173,11 @@ def stub_401(method, path, body=None, timeout=25):
 
 smoke.negative_credential_probe(res3, caller=stub_401)
 check("401 bogus token -> PASS (proper rejection)", not res3.failed)
-check("401: attempted==1 responded==1 side_effects==0",
-      res3.writes_attempted == 1 and res3.writes_responses == 1
-      and res3.writes_side_effects == 0, str(res3.write_counters()))
+check("401: attempted==1 responded==1 possible==0",
+      res3.write_counters() == {"attempted": 1, "responded": 1,
+                                "possible_side_effects": 0,
+                                "confirmed_side_effects": 0},
+      str(res3.write_counters()))
 
 res4 = smoke.Result()
 
@@ -140,12 +195,15 @@ ok1, why1, _ = smoke.verify_isolated_env(None)
 check("no --isolated-base -> denied", not ok1, why1[:60])
 ok2, why2, _ = smoke.verify_isolated_env("http://127.0.0.1:9/")
 check("non-allowlisted URL -> denied with ZERO requests", not ok2, why2[:60])
+ok2b, why2b, _ = smoke.verify_isolated_env("http://evil.example.com:8080")
+check("non-HTTPS non-loopback -> refused (zero requests)", not ok2b, why2b[:60])
 
 # ------------------------------------------- F. runtime drill: layered guard
 print("F. runtime drill — local logging server proves the zero-POST guarantee")
 import http.server
 import tempfile
 import threading
+
 
 class MockHandler(http.server.BaseHTTPRequestHandler):
     requests: list = []
@@ -161,7 +219,7 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         MockHandler.requests.append(("GET", self.path))
         if self.path == "/uibc/v1/info":
-            self._reply(200, __import__("json").dumps(MockHandler.info_body).encode())
+            self._reply(200, json.dumps(MockHandler.info_body).encode())
         else:
             self._reply(404, b'{"error":"not found"}')
 
@@ -171,6 +229,7 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *a):  # silence
         pass
+
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -185,7 +244,6 @@ try:
         fh.close()
         smoke.ISOLATED_ENV_FILE = Path(fh.name)
 
-    # F1: URL not in allowlist -> refusal, ZERO requests
     MockHandler.requests.clear()
     allowlist([])
     ok, why, _ = smoke.verify_isolated_env(mock_base)
@@ -193,7 +251,6 @@ try:
     check("F1 ZERO requests reached the server", MockHandler.requests == [],
           f"server saw: {MockHandler.requests}")
 
-    # F2: allowlisted but marker handshake fails -> only GET /info, zero POST
     MockHandler.requests.clear()
     MockHandler.info_body = {}
     allowlist([{"base": mock_base}])
@@ -203,7 +260,6 @@ try:
           MockHandler.requests == [("GET", "/uibc/v1/info")],
           f"server saw: {MockHandler.requests}")
 
-    # F3: allowlisted + marker OK -> gate opens; POST path + abnormal-success work
     MockHandler.requests.clear()
     MockHandler.info_body = {"environment": "isolated-test"}
     ok, why, entry = smoke.verify_isolated_env(mock_base)
@@ -215,13 +271,147 @@ try:
           MockHandler.requests.count(("POST", "/uibc/v1/submit")) == 1,
           f"server saw: {MockHandler.requests}")
     check("F3 200-accepting stub -> ABNORMAL SUCCESS FAIL", bool(res5.failed))
-    check("F3 counters attempted==1 responded==1 side_effects==1",
+    check("F3 counters attempted==1 responded==1 possible==1 confirmed==0",
           res5.write_counters() == {"attempted": 1, "responded": 1,
-                                    "confirmed_side_effects": 1},
+                                    "possible_side_effects": 1,
+                                    "confirmed_side_effects": 0},
           str(res5.write_counters()))
 finally:
     smoke.ISOLATED_ENV_FILE = orig_file
     server.shutdown()
+
+# --------------------------------------- G. isolated award flow (all paths)
+print("G. isolated award flow — every write path closes out with pollution compare")
+
+# G1: join non-2xx -> FAIL, pollution compare still ran (try/finally)
+res = smoke.Result()
+sc = flow_stub(join=(403, '{"error": "bad test credentials"}'))
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+check("G1 join non-2xx -> FAIL", any(r["verdict"] == "FAIL" for r in rows_by_probe(res, "isolated: join")))
+check("G1 pollution compare RAN despite early return",
+      len(rows_by_probe(res, "deep pollution (all write paths)")) == 1,
+      "try/finally close-out present")
+check("G1 join attempt counted, possible==0",
+      res.write_counters()["attempted"] == 1 and res.write_counters()["possible_side_effects"] == 0)
+
+# G2: join unreachable (timeout analog) -> FAIL + pollution compare ran
+res = smoke.Result()
+sc = flow_stub(join=(0, "timeout"))
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+check("G2 join unreachable -> FAIL", any(r["verdict"] == "FAIL" for r in rows_by_probe(res, "isolated: join")))
+check("G2 pollution compare RAN", len(rows_by_probe(res, "deep pollution (all write paths)")) == 1)
+check("G2 attempted==1 responded==0", res.write_counters()["responded"] == 0)
+
+# G3: submit non-2xx -> FAIL + pollution compare ran
+res = smoke.Result()
+sc = flow_stub(submit=(422, '{"error": "invalid package"}'))
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+check("G3 submit non-2xx -> FAIL", any(r["verdict"] == "FAIL" for r in rows_by_probe(res, "isolated: submit")))
+check("G3 pollution compare RAN", len(rows_by_probe(res, "deep pollution (all write paths)")) == 1)
+
+# G4: board without test agent -> UNVERIFIABLE + pollution compare ran
+res = smoke.Result()
+sc = flow_stub(board=(200, '{"leaderboard": []}'))
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+g4 = rows_by_probe(res, "isolated: award observation")
+check("G4 missing board row -> UNVERIFIABLE (not pass, not fail)",
+      g4 and g4[0]["verdict"] == "UNVERIFIABLE", g4[0]["detail"][:70] if g4 else "")
+check("G4 pollution compare RAN", len(rows_by_probe(res, "deep pollution (all write paths)")) == 1)
+check("G4 confirmed_side_effects==0 (agent never observed)",
+      res.write_counters()["confirmed_side_effects"] == 0)
+
+# G5 REGRESSION (false-PASS defect): zero-score agent, NO medal fields, BAD spec
+#    -> must be UNVERIFIABLE, never PASS
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": 0.0})
+smoke.isolated_award_flow(res, ENTRY, "其余", False, caller=sc)
+g5 = rows_by_probe(res, "isolated: award observation")
+check("G5 zero-score+no-medal+bad-spec -> UNVERIFIABLE (was false PASS)",
+      g5 and g5[0]["verdict"] == "UNVERIFIABLE", g5[0]["detail"][:80] if g5 else "")
+check("G5 verdict is NOT PASS", not (g5 and g5[0]["verdict"] == "PASS"))
+
+# G6: zero-score agent, NO medal fields, GOOD spec -> PASS
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": 0.0})
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+g6 = rows_by_probe(res, "isolated: award observation")
+check("G6 zero-score+no-medal+good-spec -> PASS", g6 and g6[0]["verdict"] == "PASS")
+
+# G7: zero-score agent WITH medal fields -> FAIL (criterion violation)
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": 0.0,
+                               "medal": "bronze"})
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+g7 = rows_by_probe(res, "isolated: award observation")
+check("G7 zero-score+medal -> FAIL (real values, not literal comprehension)",
+      g7 and g7[0]["verdict"] == "FAIL" and "bronze" in g7[0]["detail"],
+      g7[0]["detail"][:80] if g7 else "")
+check("G7 no literal '{k: row.get(k)...}' in detail",
+      not any("row.get(k)" in r["detail"] for r in res.rows))
+
+# G8: cert verify — 200 body WITHOUT agent reference -> UNVERIFIABLE (not pass)
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": 5.0,
+                               "cert_id": "UIBC-MEM-0001"},
+               cert=(200, '{"cert_id": "UIBC-MEM-0001", "owner": "someone-else"}'))
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+g8 = rows_by_probe(res, "isolated: cert verify")
+check("G8 cert 200 without agent reference -> UNVERIFIABLE",
+      g8 and g8[0]["verdict"] == "UNVERIFIABLE", g8[0]["detail"][:70] if g8 else "")
+
+# G9: cert verify — 200 body WITH agent reference -> PASS
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": 5.0,
+                               "cert_id": "UIBC-MEM-0002"},
+               cert=(200, json.dumps({"cert_id": "UIBC-MEM-0002",
+                                      "agent": TA["agent_id"]})))
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+g9 = rows_by_probe(res, "isolated: cert verify")
+check("G9 cert 200 + agent reference -> PASS", g9 and g9[0]["verdict"] == "PASS")
+
+# G10: agent observed on board -> INDEPENDENTLY CONFIRMED side effect
+res = smoke.Result()
+sc = flow_stub(spec_board_row={"agent_id": TA["agent_id"], "best_total": 0.0})
+smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
+check("G10 confirmed_side_effects==1 (agent visible in post-write state)",
+      res.write_counters()["confirmed_side_effects"] == 1, str(res.write_counters()))
+c10 = res.write_counters()
+check("G10 invariant attempted>=responded>=possible>=confirmed",
+      c10["attempted"] >= c10["responded"] >= c10["possible_side_effects"]
+      >= c10["confirmed_side_effects"])
+
+# G11: no test_agent configured -> SKIP, zero writes, no pollution claims
+res = smoke.Result()
+sc = flow_stub()
+smoke.isolated_award_flow(res, {"base": "x"}, None, False, caller=sc)
+g11 = rows_by_probe(res, "isolated: award+cert flow")
+check("G11 missing test_agent -> SKIP NOT VERIFIED", g11 and g11[0]["verdict"] == "SKIP")
+check("G11 zero writes performed", res.write_counters()["attempted"] == 0)
+check("G11 no pollution row emitted (no write happened)",
+      len(rows_by_probe(res, "deep pollution")) == 0)
+
+# ------------------------------------------------- H. schema medal check
+print("H. schema medal check — structural nodes, substring trap, UNVERIFIABLE")
+GOOD_SPEC = {"bronze": {"min_score": 1}}
+schema = {"properties": {"award": {"medal": {"bronze": {"min_score": {"type": "number"}}}}}}
+v, d = smoke.schema_medal_check(json.dumps(schema), GOOD_SPEC)
+check("H1 structured schema node -> PASS", v == "PASS", d[:70])
+check("H1 node path reported structurally", "$.properties.award.medal" in d, d[:80])
+schema_str = {"description": "the medal min_score rules apply"}
+v, d = smoke.schema_medal_check(json.dumps(schema_str), GOOD_SPEC)
+check("H2 substring-only mention -> WARN (structural check, not substring)",
+      v == "WARN", d[:70])
+schema_weak = {"properties": {"medal": {"type": "string"}}}
+v, d = smoke.schema_medal_check(json.dumps(schema_weak), GOOD_SPEC)
+check("H3 nodes without object/numeric structure -> UNVERIFIABLE",
+      v == "UNVERIFIABLE", d[:70])
+v, d = smoke.schema_medal_check(json.dumps(schema), {"bronze": "其余"})
+check("H4 prose /info + nodes -> OBSERVE (no threshold guessing)", v == "OBSERVE", d[:70])
+v, d = smoke.schema_medal_check(None, GOOD_SPEC)
+check("H5 schema unavailable -> UNVERIFIABLE", v == "UNVERIFIABLE")
+schema_trap = {"note_min_score_x": 1}
+v, d = smoke.schema_medal_check(json.dumps(schema_trap), GOOD_SPEC)
+check("H6 lookalike key is NOT matched (exact key match only)", v == "WARN", d[:70])
 
 # ----------------------------------------------------------------------------
 print(f"\n{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else " — all negative controls hold"))

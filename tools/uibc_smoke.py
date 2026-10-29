@@ -15,29 +15,34 @@ Methodology: `online-scoring-service-blackbox-audit` (skill). Hard rules obeyed:
          (no substring, no "looks like test" heuristics);
       3. a marker handshake: GET /uibc/v1/info on that deployment must return
          marker_key == marker_value (defaults: environment == "isolated-test").
-    Any refusal happens BEFORE any write-class request is emitted (the only
-    request possibly emitted during gating is a GET /info on the allowlisted
-    isolated deployment itself).
-  - Write accounting distinguishes request ATTEMPTS, HTTP RESPONSES, and
-    CONFIRMED potential side effects (2xx on a write endpoint). A POST that
-    was sent is never reported as zero writes.
-  - An invalid-credential POST answered with 2xx is an ABNORMAL SUCCESS:
-    immediate FAIL, counted as a confirmed potential side effect, deep
-    pollution check mandatory.
-  - Every probe class has a NEGATIVE CONTROL that must be able to fail:
-      * route-existence probe  -> a definitely-absent path must 404
-      * semantic-404 probe     -> a fake cert body must DIFFER from the
-                                  unknown-path control body (documented trap)
-      * medal-spec parser      -> selftest proves bad specs are rejected
-      * deep-pollution compare -> selftest proves None/unverifiable -> FAIL
-      * abnormal-success path  -> selftest proves a 2xx rejection bypass is caught
+    Any refusal happens BEFORE any write-class request is emitted.
+
+    SECURITY SCOPE (stated, not oversold): the static marker is an
+    anti-misoperation guard only. It does NOT defend against an adversarial
+    impersonator of the isolated environment. HMAC/nonce schemes are NOT
+    implemented — key management needs a reviewed design first (owner decision
+    pending). Isolated-env entry checklist (all REQUIRED before adding an
+    entry): exact-base allowlisting; HTTPS or loopback-only HTTP; verified
+    environment marker; dedicated test credentials; NO production secrets.
+
+  - Write accounting distinguishes: attempts, responses, POSSIBLE side
+    effects (2xx on a write endpoint — 2xx alone does NOT prove a DB/cert
+    change), and INDEPENDENTLY CONFIRMED side effects (the write's effect is
+    observable in a post-write state snapshot). Failed/abnormal responses keep
+    their evidence; "unconfirmed" is never reported as "confirmed absent".
+  - A 2xx on an invalid-credential POST is an ABNORMAL SUCCESS: immediate
+    FAIL + possible-side-effect count + mandatory deep pollution comparison.
+  - EVERY write path (success, non-2xx, timeout/unreachable, missing board
+    row) ends in the deep pollution comparison via try/finally — early
+    returns cannot bypass it.
+  - Every probe class has a NEGATIVE CONTROL that must be able to fail
+    (see tools/uibc_smoke_selftest.py).
 
 Usage:
   uibc_smoke.py                                # read-only arm (production default)
   uibc_smoke.py --base URL                     # read-only arm against URL
   uibc_smoke.py --isolated-base URL --allow-reject-probes
-                                     # + write-class negatives, gated as above
-  uibc_smoke.py --isolated-base URL --allow-reject-probes   # refused: URL not allowlisted
+                                    # + write-class negatives, gated as above
 """
 
 from __future__ import annotations
@@ -65,21 +70,31 @@ ISOLATED_ENV_FILE = Path(__file__).resolve().parent / "isolated_envs.json"
 # evidence is not evidence of compliance)
 RED_VERDICTS = ("FAIL", "UNVERIFIABLE")
 
+SNAPSHOT_SCOPE = ("GET /leaderboard?track=MEM (top<=500): entry rows incl. best_total, "
+                  "submissions, last_submit_at and any medal/cert fields the board "
+                  "exposes. BLIND SPOTS: rows beyond top=500, other tracks, the "
+                  "certificate store, and any state the API does not expose.")
+
 
 class Result:
     """Probe log + write accounting.
 
-    writes_attempted    — write-class HTTP requests actually SENT (>= 0)
-    writes_responses    — attempts that received ANY HTTP response (status != 0)
-    writes_side_effects — attempts answered with 2xx (potential mutation confirmed)
-    Invariant checked in payload(): attempted >= responded >= side_effects.
+    attempted    — write-class HTTP requests actually SENT
+    responded    — attempts that received ANY HTTP response (status != 0)
+    possible_side_effects — attempts answered with 2xx (2xx alone does NOT
+                   prove a DB/certificate mutation — hence "possible")
+    confirmed_side_effects — writes whose effect is INDEPENDENTLY observable
+                   in a post-write state snapshot (e.g. the test agent appears
+                   on the board after join/submit)
+    Invariant: attempted >= responded >= possible >= confirmed.
     """
 
     def __init__(self) -> None:
         self.rows: list[dict] = []
         self.writes_attempted = 0
         self.writes_responses = 0
-        self.writes_side_effects = 0
+        self.writes_possible_side_effects = 0
+        self.writes_confirmed_side_effects = 0
 
     def add(self, probe: str, verdict: str, detail: str, **extra) -> None:
         row = {"probe": probe, "verdict": verdict, "detail": detail}
@@ -94,7 +109,8 @@ class Result:
     def write_counters(self) -> dict:
         return {"attempted": self.writes_attempted,
                 "responded": self.writes_responses,
-                "confirmed_side_effects": self.writes_side_effects}
+                "possible_side_effects": self.writes_possible_side_effects,
+                "confirmed_side_effects": self.writes_confirmed_side_effects}
 
 
 def call(method: str, path: str, body: dict | None = None, timeout: int = 25):
@@ -119,14 +135,15 @@ def unreachable(st: int) -> bool:
     return st == 0
 
 
-def snapshot_state() -> dict | None:
-    """Deep, hashable snapshot of exposed competition state (P1 pollution check).
+def snapshot_state(caller=call) -> dict | None:
+    """Snapshot of EXPOSED competition state (single track, top<=500).
 
-    Covers what the API exposes: entry records, scores (best_total per row),
-    and any medal/cert fields carried on leaderboard rows. Returns None when
-    the snapshot is unavailable (unreachable / non-200 / unparseable).
+    Scope and blind spots are documented in SNAPSHOT_SCOPE and must be
+    reported alongside any pollution conclusion — a leaderboard snapshot is
+    NOT a proof that the whole database is unchanged.
+    Returns None when unavailable (unreachable / non-200 / unparseable).
     """
-    st, body, _ = call("GET", f"{V}/leaderboard?track=MEM&top=500")
+    st, body, _ = caller("GET", f"{V}/leaderboard?track=MEM&top=500")
     if st != 200:
         return None
     try:
@@ -143,9 +160,8 @@ def snapshot_state() -> dict | None:
         return None
 
 
-def board_total() -> int | None:
-    """Total agent count from the leaderboard snapshot (None when unavailable)."""
-    snap = snapshot_state()
+def board_total(caller=call) -> int | None:
+    snap = snapshot_state(caller)
     return snap["total_agents"] if snap else None
 
 
@@ -153,7 +169,8 @@ def compare_states(before: dict | None, after: dict | None):
     """Compare two snapshots. Returns (verdict, detail).
 
     Negative-control property (proven in selftest): an UNAVAILABLE snapshot
-    (None) must yield UNVERIFIABLE/FAIL — never PASS.
+    (None) must yield UNVERIFIABLE — never PASS. A PASS means "no change in
+    the EXPOSED snapshot scope", never "the database is unchanged".
     """
     if before is None or after is None:
         return "UNVERIFIABLE", (
@@ -161,31 +178,25 @@ def compare_states(before: dict | None, after: dict | None):
             f"after={'ok' if after else 'None'}) — absence of evidence is not "
             "evidence of no pollution")
     if before == after:
-        return "PASS", (f"deep state unchanged: total={before['total_agents']} "
+        return "PASS", (f"no change in EXPOSED snapshot (scope-limited, NOT a "
+                        f"DB-wide proof): total={before['total_agents']} "
                         f"rows={before['row_count']} "
                         f"rows_sha256={before['rows_sha256'][:12]}…")
     changed = [k for k in before if before.get(k) != after.get(k)]
-    return "FAIL", f"state CHANGED in {changed}: {before} -> {after} — possible pollution"
+    return "FAIL", f"EXPOSED state CHANGED in {changed}: {before} -> {after} — possible pollution"
 
 
 def _parse_bronze_floor(bronze_spec):
     """Structurally parse the declared bronze medal spec.
 
-    Returns (floor, ok, reason):
-      floor  — the minimum threshold declared (machine-readable only)
-      ok     — True only when a finite, non-bool, numeric floor exists that
-               excludes a 0-score entrant
-      reason — human-readable explanation when ok is False
-
-    Rules (no substring heuristics like "min" in the name — the field must
-    actually parse as a number):
-      * dict  : bronze.min_score must be a finite, non-bool number and, under
-                "score >= min_score" semantics, min_score > 0.
-      * str   : must fullmatch ">=N" or ">N" (N finite numeric);
-                ">=N" excludes 0 only if N > 0; ">N" excludes 0 if N >= 0.
-      * anything else (prose such as "其余"/"others", missing, wrong type,
-                NaN/Infinity, string-encoded numbers): NOT a floor -> the spec
-                grants bronze to a 0-score entrant.
+    Returns (floor, ok, reason). ok=True only for a finite, non-bool, numeric
+    floor that excludes a 0-score entrant:
+      * dict  : bronze.min_score — finite non-bool number; semantics
+                "score >= min_score" so min_score > 0.
+      * str   : fullmatch ">=N" / ">N" (N finite); ">=N" excludes 0 only if
+                N > 0; ">N" excludes 0 if N >= 0.
+      * everything else (prose, missing, wrong type, NaN/Infinity,
+        string-encoded numbers): NOT a floor.
     """
     if isinstance(bronze_spec, dict):
         v = bronze_spec.get("min_score")
@@ -200,8 +211,6 @@ def _parse_bronze_floor(bronze_spec):
         m = re.fullmatch(r"(>=?)\s*(\d+(?:\.\d+)?)", bronze_spec.strip())
         if m:
             op, v = m.group(1), float(m.group(2))
-            # semantics: bronze granted when score {op} threshold
-            #   ">=N" excludes 0 only if N > 0;  ">N" excludes 0 as long as N >= 0
             ok = (v > 0) if op == ">=" else (v >= 0)
             if ok:
                 return v, True, ""
@@ -211,11 +220,63 @@ def _parse_bronze_floor(bronze_spec):
     return None, False, f"bronze spec has unsupported type: {bronze_spec!r}"
 
 
+def _find_schema_nodes(node, keys, path="$"):
+    """Recursively collect (path, key, value) for dict keys in `keys`.
+    Structural lookup for schema checks — no substring matching."""
+    out = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{path}.{k}"
+            if k in keys:
+                out.append((p, k, v))
+            out.extend(_find_schema_nodes(v, keys, p))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out.extend(_find_schema_nodes(v, keys, f"{path}[{i}]"))
+    return out
+
+
+def schema_medal_check(schema_body: str | None, medals) -> tuple[str, str]:
+    """Cross-check /info's medal declaration against the formal /schema.
+
+    Structural: locates actual medal/min_score nodes (path+type), never
+    substring matching. If the rule's meaning cannot be confirmed from the
+    schema structure, the verdict is UNVERIFIABLE — thresholds are never guessed.
+    """
+    if schema_body is None:
+        return "UNVERIFIABLE", "/schema unavailable — consistency with /info cannot be checked"
+    try:
+        schema = json.loads(schema_body)
+    except Exception as e:  # noqa: BLE001
+        return "UNVERIFIABLE", f"/schema unparseable: {e} — consistency cannot be checked"
+    nodes = _find_schema_nodes(schema, ("medal", "min_score"))
+    machine_declared = (isinstance(medals, dict)
+                        and _parse_bronze_floor(medals.get("bronze"))[1])
+    if not nodes:
+        if machine_declared:
+            return "WARN", ("/info declares a machine-readable bronze floor but /schema "
+                            "contains NO medal/min_score nodes — declaration is NOT schema-backed")
+        return "OBSERVE", "/schema describes no medal fields and /info declares none — nothing to cross-check"
+    # a node only counts as threshold-bearing when it IS min_score or a dict
+    # that CONTAINS a min_score key — a bare "medal" object (e.g. a JSON-schema
+    # node describing a string) does not define the rule
+    threshold_nodes = [(p, v) for p, k, v in nodes
+                       if k == "min_score"
+                       or (isinstance(v, dict) and "min_score" in v)]
+    if machine_declared:
+        if threshold_nodes:
+            return "PASS", (f"/schema is schema-backed: min_score threshold structure "
+                            f"found at {[p for p, _ in threshold_nodes][:3]}")
+        return "UNVERIFIABLE", (f"/schema mentions medal nodes {[p for p, _, _ in nodes][:3]} "
+                                "but none carries a min_score threshold structure — the rule's "
+                                "meaning cannot be confirmed; NOT reported as schema-backed")
+    return "OBSERVE", (f"/schema describes medal fields at {[p for p, _, _ in nodes][:3]} "
+                       "but /info declares no machine-readable floor")
+
+
 def negative_credential_probe(res: Result, caller=call):
-    """Fail-fast invalid-credential POST. Write accounting is exact:
-    an attempted POST is never reported as zero writes, and a 2xx answer is
-    an ABNORMAL SUCCESS (FAIL + confirmed potential side effect), never a
-    quietly-ignored rejection-test miss."""
+    """Fail-fast invalid-credential POST. Exact write accounting; a 2xx is an
+    ABNORMAL SUCCESS (FAIL + possible side effect), never quietly ignored."""
     res.writes_attempted += 1
     st, body, _ = caller("POST", f"{V}/submit", {
         "agent_id": "uibc-mem-2026-00000000",
@@ -226,15 +287,16 @@ def negative_credential_probe(res: Result, caller=call):
     if unreachable(st):
         res.add("negative: invalid credentials", "FAIL",
                 "POST was ATTEMPTED but no HTTP response arrived (sentinel 0) — "
-                "outcome unknown; counted in writes_attempted, not in responses")
+                "outcome unknown; counted as attempted, not responded")
         return
     res.writes_responses += 1
     if 200 <= st < 300:
-        res.writes_side_effects += 1
+        res.writes_possible_side_effects += 1
         res.add("negative: invalid credentials", "FAIL",
                 f"ABNORMAL SUCCESS: bogus token accepted with {st} — unauthenticated "
-                "submit possible; counted as a CONFIRMED potential side effect; "
-                "the deep pollution check below is mandatory, not optional")
+                "submit possible; counted as a POSSIBLE side effect (2xx alone does "
+                "not prove a DB change); the deep pollution comparison that follows "
+                "is mandatory")
     elif 400 <= st < 500:
         res.add("negative: invalid credentials", "PASS",
                 f"bogus token -> {st} (4xx rejection as required; writes so far: "
@@ -244,83 +306,150 @@ def negative_credential_probe(res: Result, caller=call):
                 f"bogus token -> {st} (expected 4xx; 5xx/3xx/1xx are not rejections)")
 
 
-def isolated_award_flow(res: Result, entry: dict | None):
+def _cert_verify_check(res: Result, cert_id: str, agent_id: str, caller=call):
+    """Cert verification with CONTENT consistency — HTTP 200 alone is not a pass."""
+    st, body, _ = caller("GET", f"{V}/verify/{cert_id}")
+    if unreachable(st):
+        res.add("isolated: cert verify", "UNVERIFIABLE",
+                f"GET /verify/{cert_id} attempted, no response — content unverifiable")
+        return
+    if st != 200:
+        res.add("isolated: cert verify", "FAIL", f"GET /verify/{cert_id} -> {st}")
+        return
+    try:
+        cert_txt = json.dumps(json.loads(body), ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        res.add("isolated: cert verify", "UNVERIFIABLE",
+                f"GET /verify/{cert_id} -> 200 but body unparseable — content "
+                "consistency cannot be checked; NOT reported as verified")
+        return
+    if agent_id in cert_txt:
+        res.add("isolated: cert verify", "PASS",
+                f"cert {cert_id}: 200 AND content references test agent {agent_id}")
+    else:
+        res.add("isolated: cert verify", "UNVERIFIABLE",
+                f"cert {cert_id}: 200 but content does not reference agent {agent_id} "
+                f"(body[:160]={cert_txt[:160]!r}) — consistency unconfirmed; "
+                "NOT reported as verified")
+
+
+def isolated_award_flow(res: Result, entry: dict | None,
+                        bronze_spec, spec_ok: bool, caller=call):
     """Full join/submit/medal/cert-verify flow on the VERIFIED isolated env.
 
-    Requires the allowlist entry to carry test_agent credentials AND the exact
-    join/submit payloads (the server owner owns the valid-payload shape — the
-    smoke must not guess it). Anything missing -> NOT VERIFIED, never a silent
-    pass. Production NEVER reaches this function.
+    - EVERY exit path (success, non-2xx, timeout, missing board row) runs the
+      deep pollution comparison (try/finally) — early returns cannot skip it.
+    - A zero-score agent WITHOUT medal fields is PASS only when /info declares
+      a machine-readable exclusion floor; otherwise UNVERIFIABLE (a missing
+      field on the board is not proof of correct award logic).
+    - join/submit 2xx counts as POSSIBLE side effects; the test agent actually
+      appearing in the post-write snapshot counts as INDEPENDENTLY CONFIRMED.
+    - Cert verification checks content, not just HTTP 200.
+    Production NEVER reaches this function.
     """
-    ta = (entry or {}).get("test_agent")
+    ta = (entry or {}).get("test_agent") if isinstance(entry, dict) else None
     if (not isinstance(ta, dict) or not ta.get("agent_id") or not ta.get("token")
             or not isinstance(ta.get("join_payload"), dict)
             or not isinstance(ta.get("submit_payload"), dict)):
         res.add("isolated: award+cert flow", "SKIP",
                 "NOT VERIFIED: allowlist entry lacks test_agent "
                 "(agent_id / token / join_payload / submit_payload) — the full "
-                "award and certificate-verify flow cannot run without them")
+                "award and certificate-verify flow cannot run without them; "
+                "no write was performed")
         return
     agent_id = ta["agent_id"]
-    before = snapshot_state()
-    res.writes_attempted += 1
-    st, body, _ = call("POST", f"{V}/join", ta["join_payload"])
-    if unreachable(st):
-        res.add("isolated: award+cert flow", "FAIL",
-                "join POST attempted but no HTTP response — outcome unknown")
-        return
-    res.writes_responses += 1
-    if not (200 <= st < 300):
-        res.add("isolated: award+cert flow", "FAIL",
-                f"join -> {st} (test credentials or payload stale?)")
-        return
-    res.writes_side_effects += 1
-    res.writes_attempted += 1
-    st2, body2, _ = call("POST", f"{V}/submit", ta["submit_payload"])
-    if unreachable(st2):
-        res.add("isolated: award+cert flow", "FAIL",
-                "submit POST attempted but no HTTP response — outcome unknown")
-        return
-    res.writes_responses += 1
-    if not (200 <= st2 < 300):
-        res.add("isolated: award+cert flow", "FAIL", f"submit -> {st2}")
-        return
-    res.writes_side_effects += 1
-    # inspect the board for the test agent's medal exposure
-    st3, body3, _ = call("GET", f"{V}/leaderboard?track=MEM&top=500")
-    row = None
-    if st3 == 200:
-        try:
-            row = next((r for r in json.loads(body3).get("leaderboard", [])
-                        if r.get("agent_id") == agent_id), None)
-        except Exception:  # noqa: BLE001
-            row = None
-    if row is None:
-        res.add("isolated: award+cert flow", "UNVERIFIABLE",
-                f"test agent {agent_id} not found on the leaderboard after submit — "
-                "medal grant cannot be observed from this endpoint")
-        return
-    medal_keys = [k for k in ("medal", "cert", "certificate", "cert_id") if row.get(k)]
-    if float(row.get("best_total", -1)) <= 0 and medal_keys:
-        res.add("isolated: award+cert flow", "FAIL",
-                f"zero-score agent carries medal fields {medal_keys}: "
-                f"{{k: row.get(k) for k in medal_keys}} — criterion violated")
-    elif medal_keys:
-        res.add("isolated: award+cert flow", "PASS",
-                f"scored agent exposes medal fields {medal_keys}")
+    state_before = snapshot_state(caller)
+    try:
+        # ---- join
+        res.writes_attempted += 1
+        st, body, _ = caller("POST", f"{V}/join", ta["join_payload"])
+        if unreachable(st):
+            res.add("isolated: join", "FAIL",
+                    "POST attempted, no HTTP response — outcome unknown")
+            return
+        res.writes_responses += 1
+        if not (200 <= st < 300):
+            res.add("isolated: join", "FAIL",
+                    f"join -> {st} (test credentials or payload stale?); "
+                    f"writes: {res.write_counters()}")
+            return
+        res.writes_possible_side_effects += 1
+        # ---- submit
+        res.writes_attempted += 1
+        st2, body2, _ = caller("POST", f"{V}/submit", ta["submit_payload"])
+        if unreachable(st2):
+            res.add("isolated: submit", "FAIL",
+                    "POST attempted, no HTTP response — outcome unknown")
+            return
+        res.writes_responses += 1
+        if not (200 <= st2 < 300):
+            res.add("isolated: submit", "FAIL",
+                    f"submit -> {st2}; writes: {res.write_counters()}")
+            return
+        res.writes_possible_side_effects += 1
+        # ---- board observation
+        st3, body3, _ = caller("GET", f"{V}/leaderboard?track=MEM&top=500")
+        row = None
+        if st3 == 200:
+            try:
+                row = next((r for r in json.loads(body3).get("leaderboard", [])
+                            if r.get("agent_id") == agent_id), None)
+            except Exception:  # noqa: BLE001
+                row = None
+        if row is None:
+            res.add("isolated: award observation", "UNVERIFIABLE",
+                    f"test agent {agent_id} not found on the leaderboard after "
+                    "submit — medal grant is unobservable from this endpoint; "
+                    "NOT reported as pass or fail")
+            return
+        # the write's effect is independently observable in exposed state
+        res.writes_confirmed_side_effects += 1
+        medal_keys = [k for k in ("medal", "cert", "certificate", "cert_id")
+                      if row.get(k) not in (None, "", False)]
+        best = float(row.get("best_total", -1))
+        if best <= 0 and medal_keys:
+            sample = {k: row.get(k) for k in medal_keys}
+            res.add("isolated: award observation", "FAIL",
+                    f"zero-score agent (best_total={best}) carries medal fields "
+                    f"{medal_keys}, sample={sample} — criterion violated")
+        elif best <= 0 and not medal_keys:
+            if spec_ok:
+                res.add("isolated: award observation", "PASS",
+                        f"zero-score agent exposes no medal field, consistent with "
+                        f"the declared machine-readable floor {bronze_spec!r}")
+            else:
+                res.add("isolated: award observation", "UNVERIFIABLE",
+                        f"zero-score agent exposes no medal field, but /info's medal "
+                        f"spec ({bronze_spec!r}) is not machine-parseable — cannot "
+                        "distinguish correct exclusion from missing exposure; "
+                        "NOT reported as PASS (regression-controlled in selftest)")
+        elif medal_keys:
+            if spec_ok:
+                res.add("isolated: award observation", "PASS",
+                        f"scored agent (best_total={best}) exposes medal fields "
+                        f"{medal_keys}, consistent with the declared spec {bronze_spec!r}")
+            else:
+                res.add("isolated: award observation", "UNVERIFIABLE",
+                        f"scored agent exposes medal fields {medal_keys} but the "
+                        f"declared spec ({bronze_spec!r}) is not machine-parseable — "
+                        "cannot confirm the medal matches the rule")
+        else:
+            res.add("isolated: award observation", "UNVERIFIABLE",
+                    f"scored agent (best_total={best}) exposes no medal fields — "
+                    "cannot confirm the award actually happened")
+        # ---- cert verification (content-checked)
         cert_id = row.get("cert_id") or row.get("certificate")
         if cert_id:
-            st4, _, _ = call("GET", f"{V}/verify/{cert_id}")
-            res.add("isolated: cert verify", "PASS" if st4 == 200 else "FAIL",
-                    f"GET /verify/{cert_id} -> {st4}")
+            _cert_verify_check(res, str(cert_id), agent_id, caller=caller)
         else:
             res.add("isolated: cert verify", "OBSERVE",
-                    "row exposes no verifiable cert id — cert-verify step untestable from board")
-    else:
-        res.add("isolated: award+cert flow", "PASS",
-                "agent on board without medal exposure (award logic defers to /info spec)")
-    verdict_s, detail_s = compare_states(before, snapshot_state())
-    res.add("isolated: deep pollution (award flow)", verdict_s, detail_s)
+                    "row exposes no verifiable cert id — cert-verify step "
+                    "untestable from the board")
+    finally:
+        state_after = snapshot_state(caller)
+        verdict_s, detail_s = compare_states(state_before, state_after)
+        res.add("isolated: deep pollution (all write paths)", verdict_s,
+                detail_s + f" | scope: {SNAPSHOT_SCOPE} | writes: {res.write_counters()}")
 
 
 def verify_isolated_env(isolated_base: str | None):
@@ -328,16 +457,24 @@ def verify_isolated_env(isolated_base: str | None):
 
     MUST refuse BEFORE any network request when the base is not exactly
     allowlisted (zero I/O in that case); the handshake itself is a GET on the
-    allowlisted isolated deployment — never a write.
+    allowlisted isolated deployment — never a write. The static marker is an
+    anti-misoperation guard, not an adversarial defense (see module docstring).
     """
     if not isolated_base:
         return False, ("write-class probes DENIED by default: no --isolated-base given. "
                        "--base can never enable writes (production protection). "
                        "No request emitted."), None
     norm = isolated_base.rstrip("/")
+    # loopback plain-HTTP is the standard isolated deployment shape; anything
+    # else must be https (checked here and documented in the allowlist entry)
+    if not norm.startswith("https://"):
+        host = norm.split("://", 1)[-1].split("/", 1)[0].split(":")[0]
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return False, (f"refused: non-HTTPS, non-loopback target '{norm}' — add an "
+                           "explicit https base or use a loopback address. No request "
+                           "emitted."), None
     if not ISOLATED_ENV_FILE.exists():
-        return False, (f"allowlist file missing: {ISOLATED_ENV_FILE}. "
-                       "No request emitted."), None
+        return False, f"allowlist file missing: {ISOLATED_ENV_FILE}. No request emitted.", None
     try:
         cfg = json.loads(ISOLATED_ENV_FILE.read_text(encoding="utf-8"))
     except Exception as e:  # noqa: BLE001
@@ -389,10 +526,6 @@ def run(allow_reject: bool, isolated_entry: dict | None = None) -> Result:
             medals = info.get("medal")
             res.add("contract: GET /info", "PASS", f"200, {n_ep} endpoints declared, medal={medals}",
                     endpoints=sorted(info.get("endpoints", {}).keys()))
-            # Negative control for the medal spec: the declared bronze spec must be a
-            # machine-readable, finite, positive minimum-score floor. Missing field,
-            # wrong type, prose, NaN/Infinity all FAIL — the default must be
-            # FAIL, never PASS, when the spec cannot be verified.
             if not isinstance(medals, dict) or "bronze" not in medals:
                 res.add("medal-spec: zero-score exclusion declared", "FAIL",
                         f"/info medal spec missing or not an object: medal={medals!r} — "
@@ -415,35 +548,14 @@ def run(allow_reject: bool, isolated_entry: dict | None = None) -> Result:
                 f"expected 200, got {st}" + (" (unreachable: no HTTP response)" if unreachable(st) else ""))
 
     # ---- 2. schema endpoint
-    st, body, _ = call("GET", f"{V}/schema")
+    st, schema_body, _ = call("GET", f"{V}/schema")
     schema_ok = st == 200
     res.add("contract: GET /schema", "PASS" if schema_ok else "FAIL",
-            f"{st}, {len(body)} bytes" + (" (unreachable: no HTTP response)" if unreachable(st) else ""))
+            f"{st}, {len(schema_body)} bytes" + (" (unreachable: no HTTP response)" if unreachable(st) else ""))
 
-    # ---- 2b. medal declaration vs formal /schema (read-only; P1)
-    if schema_ok:
-        try:
-            schema_txt = json.dumps(json.loads(body), ensure_ascii=False)
-            machine_declared = (isinstance(medals, dict)
-                                and _parse_bronze_floor(medals.get("bronze"))[1])
-            schema_backed = ("medal" in schema_txt) or ("min_score" in schema_txt)
-            if machine_declared and not schema_backed:
-                res.add("schema: medal spec schema-backed", "WARN",
-                        "/info declares a machine-readable bronze floor but /schema "
-                        "describes no medal/min_score fields — declaration is NOT schema-backed")
-            elif schema_backed:
-                res.add("schema: medal spec schema-backed", "PASS",
-                        "/schema describes medal/min_score fields — declaration is schema-backed")
-            else:
-                res.add("schema: medal spec schema-backed", "OBSERVE",
-                        "/schema describes no medal fields and /info declares none — "
-                        "nothing to cross-check yet")
-        except Exception as e:  # noqa: BLE001
-            res.add("schema: medal spec schema-backed", "UNVERIFIABLE",
-                    f"/schema unparseable: {e} — consistency with /info cannot be checked")
-    else:
-        res.add("schema: medal spec schema-backed", "UNVERIFIABLE",
-                f"/schema unavailable (status {st}) — consistency with /info cannot be checked")
+    # ---- 2b. medal declaration vs formal /schema (structural; P1)
+    v_sch, d_sch = schema_medal_check(schema_body if schema_ok else None, medals)
+    res.add("schema: medal spec schema-backed", v_sch, d_sch)
 
     # ---- 3. leaderboard (before) + internal consistency
     state_before = snapshot_state()
@@ -460,11 +572,6 @@ def run(allow_reject: bool, isolated_entry: dict | None = None) -> Result:
                     f"rank-order monotonic={monotonic}, zero-score rows={len(zero_rows)}")
             if not monotonic:
                 res.add("leaderboard: rank order", "FAIL", "best_total not monotonically non-increasing by rank")
-            # Inspect the ACTUAL medal/cert fields on zero-score rows — do not stop at
-            # counting them. If a row exposes a non-empty medal/cert value, that is a
-            # direct criterion violation. If the board exposes no such field at all,
-            # medal granting is NOT verifiable from this endpoint (say so explicitly;
-            # field-absent here does not prove the cert path is clean).
             if zero_rows:
                 medal_keys = [k for k in ("medal", "cert", "certificate", "cert_id")
                               if any(r.get(k) not in (None, "", False) for r in zero_rows)]
@@ -488,7 +595,6 @@ def run(allow_reject: bool, isolated_entry: dict | None = None) -> Result:
     fake = f"UIBC-MEM-9999-FAKE{int(datetime.now(timezone.utc).timestamp())}"
     st, body, _ = call("GET", f"{V}/verify/{fake}")
     if st == 404:
-        # trap: a semantic 404 must differ from the unknown-path control body
         if body.strip() and body.strip() != body_ctl.strip():
             res.add("verify: fake cert (negative)", "PASS",
                     "404 with a *business-semantic* body (differs from unknown-path control) => route exists, cert absent")
@@ -500,10 +606,6 @@ def run(allow_reject: bool, isolated_entry: dict | None = None) -> Result:
                 f"expected 404, got {st}" + (" (unreachable: no HTTP response)" if unreachable(st) else ""))
 
     # ---- 5. route existence for write endpoints (OPTIONS only in read-only arm)
-    # A 5xx on OPTIONS is a real server defect (route exists but handler/capacity
-    # is broken): it must FAIL the run, not pass as WARN. Previously 500s were
-    # recorded as WARN, which let a "14 probes passed, 0 FAIL" verdict coexist
-    # with three 500 responses in the same run (observed 2026-10-29, Run 40854189959).
     for ep in WRITE_ENDPOINTS:
         st, body, hdrs = call("OPTIONS", f"{V}/{ep}")
         if st in (200, 204, 405):
@@ -515,34 +617,33 @@ def run(allow_reject: bool, isolated_entry: dict | None = None) -> Result:
         else:
             res.add(f"route: OPTIONS /{ep}", "WARN", f"{st} (allow={hdrs.get('Allow', hdrs.get('allow',''))})")
 
-    # ---- 6. negative credential probe (DEFAULT-DENIED; verified isolated env only)
-    if allow_reject:
-        negative_credential_probe(res)
-    else:
-        res.add("negative: invalid credentials", "SKIP",
-                "not run — write-class probes are default-denied; enabling requires "
-                "--isolated-base exactly listed in tools/isolated_envs.json AND passing "
-                "the marker handshake")
+    bronze_spec = medals.get("bronze") if isinstance(medals, dict) else None
+    spec_ok = _parse_bronze_floor(bronze_spec)[1] if bronze_spec is not None else False
 
-    # ---- 7. pollution assertion
+    # ---- 6..8 writes (isolated only) with GUARANTEED pollution close-out:
+    # the try/finally ensures every exit path (non-2xx, timeout, missing row,
+    # unexpected exception) still runs the before/after state comparison.
     if allow_reject:
-        # deep before/after on the isolated env: entry records, scores, medal-exposed
-        # fields via leaderboard snapshot; certificate store separately.
-        verdict_s, detail_s = compare_states(state_before, snapshot_state())
-        res.add("pollution: deep state compare (isolated)", verdict_s,
-                detail_s + f" [writes: {res.write_counters()}]")
-        res.add("pollution: certificate store (isolated)", "UNVERIFIABLE",
-                "no public endpoint enumerates certificates — a before/after comparison "
-                "of the certificate store is impossible from the API alone; this absence "
-                "of evidence is UNVERIFIABLE, not cleanliness. "
-                f"[writes: {res.write_counters()}]")
+        try:
+            negative_credential_probe(res)
+            isolated_award_flow(res, isolated_entry, bronze_spec, spec_ok)
+        finally:
+            verdict_s, detail_s = compare_states(state_before, snapshot_state())
+            res.add("pollution: deep state compare (isolated, all writes)", verdict_s,
+                    detail_s + f" | writes: {res.write_counters()}")
+            res.add("pollution: certificate store (isolated)", "UNVERIFIABLE",
+                    "no public endpoint enumerates certificates — before/after "
+                    "comparison of the certificate store is impossible from the API "
+                    "alone; this is a COVERAGE GAP, not proof of cleanliness. "
+                    f"| writes: {res.write_counters()}")
+            res.add("pollution: snapshot scope", "OBSERVE", SNAPSHOT_SCOPE)
     else:
-        # read-only arm: total comparison; UNVERIFIABLE must NOT be counted as PASS
         total_after = board_total()
         if total_before is not None and total_after is not None:
             if total_before == total_after:
                 res.add("pollution: board total unchanged", "PASS",
-                        f"total_agents {total_before} -> {total_after} [writes: {res.write_counters()}]")
+                        f"total_agents {total_before} -> {total_after} [writes: "
+                        f"{res.write_counters()}] (read-only arm; scope-limited evidence)")
             else:
                 res.add("pollution: board total unchanged", "FAIL",
                         f"total_agents {total_before} -> {total_after} — production board may be polluted")
@@ -551,10 +652,6 @@ def run(allow_reject: bool, isolated_entry: dict | None = None) -> Result:
                     f"total_agents {total_before} -> {total_after} "
                     "(no HTTP 200 from /leaderboard; sentinel 0 = unreachable) — "
                     "absence of evidence is not evidence of no pollution")
-
-    # ---- 8. full award + cert-verify flow (isolated env ONLY; never production)
-    if allow_reject:
-        isolated_award_flow(res, isolated_entry)
 
     return res
 
