@@ -237,27 +237,46 @@ def _find_schema_nodes(node, keys, path="$"):
 
 
 def _min_score_semantics(v) -> tuple[bool, str]:
-    """Semantic check for a min_score node's VALUE.
+    """Semantic proof standard for a min_score node's VALUE (round-6, P1 fix).
 
-    Accepts exactly two shapes:
-      a) a literal finite number (bool is NOT a number here);
-      b) a JSON-schema constraint node that declares a numeric type and/or a
-         minimum/exclusiveMinimum bound.
-    Anything else (string numbers, bools, prose dicts, bare "medal" objects)
-    cannot prove a threshold -> not schema-backed.
+    "The field is numeric" is NOT "a threshold exists". A threshold is PROVEN
+    only when BOTH hold:
+      1. a threshold VALUE exists — either the node is itself a literal finite
+         number, or the constraint node carries a numeric minimum /
+         exclusiveMinimum bound;
+      2. a COMPARISON SEMANTICS exists that excludes zero-score entrants —
+         the bound must be finite and > 0 (minimum=0 or a negative bound
+         cannot exclude a 0-score medal, and an invalid bound value — string,
+         bool, null, NaN — proves nothing).
+    Anything less -> not provable -> UNVERIFIABLE upstream.
     """
     if isinstance(v, bool) or v is None:
         return False, f"min_score value {v!r} is not numeric (bool/None rejected)"
     if isinstance(v, (int, float)):
-        if math.isfinite(v):
-            return True, "literal finite number"
-        return False, "min_score is a non-finite number (NaN/Inf)"
+        if not math.isfinite(v):
+            return False, "min_score is a non-finite number (NaN/Inf)"
+        if v <= 0:
+            return False, f"literal threshold {v} cannot exclude zero-score entrants (must be >0)"
+        return True, f"literal threshold {v} (>0: a 0-score entrant is below the floor)"
     if isinstance(v, dict):
-        t = v.get("type")
-        if t in ("number", "integer") or ("minimum" in v) or ("exclusiveMinimum" in v):
-            return True, f"schema constraint node (type={t!r}, minimum={v.get('minimum')!r})"
-        return False, (f"min_score node {json.dumps(v)[:80]} declares no numeric type "
-                       "or minimum bound — no threshold provable")
+        bounds = []
+        for key in ("minimum", "exclusiveMinimum"):
+            if key in v:
+                b = v[key]
+                if isinstance(b, bool) or not isinstance(b, (int, float)) \
+                        or not math.isfinite(b):
+                    return False, (f"{key}={b!r} is not a finite number — invalid "
+                                   "constraint value proves no threshold")
+                if b <= 0:
+                    return False, (f"{key}={b} cannot exclude zero-score entrants "
+                                   "(zero/negative threshold)")
+                op = ">=" if key == "minimum" else ">"
+                bounds.append(f"{key}={b} ({op}0 semantics: a 0-score entrant is excluded)")
+        if bounds:
+            return True, "; ".join(bounds)
+        return False, (f"min_score node declares type={v.get('type')!r} but NO numeric "
+                       "bound (minimum/exclusiveMinimum) — a numeric TYPE alone does not "
+                       "prove a threshold VALUE or its comparison semantics")
     return False, f"min_score value has non-numeric type {type(v).__name__}"
 
 

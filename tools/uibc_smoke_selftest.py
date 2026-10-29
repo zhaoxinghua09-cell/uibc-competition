@@ -395,10 +395,12 @@ check("G11 no pollution row emitted (no write happened)",
 # ------------------------------------------------- H. schema medal check
 print("H. schema medal check — structural nodes, substring trap, UNVERIFIABLE")
 GOOD_SPEC = {"bronze": {"min_score": 1}}
-schema = {"properties": {"award": {"medal": {"bronze": {"min_score": {"type": "number"}}}}}}
-v, d = smoke.schema_medal_check(json.dumps(schema), GOOD_SPEC)
-check("H1 structured schema node -> PASS", v == "PASS", d[:70])
-check("H1 node path reported structurally", "$.properties.award.medal" in d, d[:80])
+schema_type_only = {"properties": {"award": {"medal": {"bronze": {"min_score": {"type": "number"}}}}}}
+v, d = smoke.schema_medal_check(json.dumps(schema_type_only), GOOD_SPEC)
+check("H1 (P1-updated) numeric type WITHOUT bound -> UNVERIFIABLE (a numeric "
+      "type alone proves no threshold value or comparison semantics)",
+      v == "UNVERIFIABLE", d[:80])
+check("H1 node path still reported structurally", "$.properties.award.medal" in d, d[:80])
 schema_str = {"description": "the medal min_score rules apply"}
 v, d = smoke.schema_medal_check(json.dumps(schema_str), GOOD_SPEC)
 check("H2 substring-only mention -> WARN (structural check, not substring)",
@@ -407,7 +409,7 @@ schema_weak = {"properties": {"medal": {"type": "string"}}}
 v, d = smoke.schema_medal_check(json.dumps(schema_weak), GOOD_SPEC)
 check("H3 nodes without object/numeric structure -> UNVERIFIABLE",
       v == "UNVERIFIABLE", d[:70])
-v, d = smoke.schema_medal_check(json.dumps(schema), {"bronze": "其余"})
+v, d = smoke.schema_medal_check(json.dumps(schema_type_only), {"bronze": "其余"})
 check("H4 prose /info + nodes -> OBSERVE (no threshold guessing)", v == "OBSERVE", d[:70])
 v, d = smoke.schema_medal_check(None, GOOD_SPEC)
 check("H5 schema unavailable -> UNVERIFIABLE", v == "UNVERIFIABLE")
@@ -517,6 +519,44 @@ smoke.isolated_award_flow(res, ENTRY, {"min_score": 1}, True, caller=sc)
 obs = rows_by_probe(res, "award observation")
 check("I16 NaN best_total -> FAIL (non-finite)", obs and obs[0]["verdict"] == "FAIL",
       obs[0]["detail"][:70] if obs else "no row")
+
+# ------------------------- J. P1 negative controls: threshold proof standard
+print("J. min_score proof standard — value AND comparison semantics both required")
+print("J.a threshold proof requires a numeric bound >0 (type:number is NOT proof)")
+
+
+def schema_check_of(minscore_node):
+    s = {"properties": {"medal": {"min_score": minscore_node}}}
+    return smoke.schema_medal_check(json.dumps(s), GOOD_SPEC)
+
+
+v, d = schema_check_of({"type": "number"})
+check("J1 type:number alone -> UNVERIFIABLE (P1 core: type != threshold)",
+      v == "UNVERIFIABLE", d[:80])
+v, d = schema_check_of({"type": "number", "minimum": "1"})
+check("J2 minimum as STRING -> UNVERIFIABLE (invalid constraint value)",
+      v == "UNVERIFIABLE", d[:80])
+v, d = schema_check_of({"type": "number", "minimum": 0})
+check("J3 minimum=0 -> UNVERIFIABLE (zero threshold cannot exclude 0-score)",
+      v == "UNVERIFIABLE", d[:80])
+v, d = schema_check_of({"type": "number", "minimum": -1})
+check("J4 negative minimum -> UNVERIFIABLE", v == "UNVERIFIABLE", d[:80])
+v, d = schema_check_of({"type": "number", "minimum": True})
+check("J5 minimum as BOOL -> UNVERIFIABLE (invalid constraint value)",
+      v == "UNVERIFIABLE", d[:80])
+v, d = schema_check_of({"type": "number", "exclusiveMinimum": 1})
+check("J6 exclusiveMinimum=1 -> PASS (bound + '>' comparison semantics proven)",
+      v == "PASS", d[:80])
+v, d = schema_check_of(0)
+check("J7 literal threshold 0 -> UNVERIFIABLE (cannot exclude 0-score)",
+      v == "UNVERIFIABLE", d[:80])
+v, d = schema_check_of({"type": "integer", "minimum": 2.5})
+check("J8 minimum=2.5 >0 -> PASS (finite positive bound)", v == "PASS", d[:80])
+# end-to-end negative: threshold in schema WEAKER than /info floor must not PASS
+v, d = schema_check_of({"type": "number", "minimum": 0.5})
+check("J9 sanity: any positive bound proves schema-backed structure (value "
+      "cross-check vs /info floor is server-side territory, recorded in detail)",
+      v == "PASS" and "minimum=0.5" in d, d[:90])
 
 # ----------------------------------------------------------------------------
 print(f"\n{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else " — all negative controls hold"))
