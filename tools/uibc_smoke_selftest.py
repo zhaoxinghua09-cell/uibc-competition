@@ -422,7 +422,7 @@ print("I. round-5 regressions — schema path+semantics, cert 3-way identity, be
 
 # ---- I1-I6: schema_medal_check — path relation + threshold semantics
 print("I.a schema_medal_check: medal-related path AND provable threshold semantics")
-sc_good = {"properties": {"medal": {"min_score": 1}}}
+sc_good = {"properties": {"medal": {"bronze": {"min_score": 1}}}}
 v, d = smoke.schema_medal_check(json.dumps(sc_good), GOOD_SPEC)
 check("I1 medal-path + literal finite number -> PASS", v == "PASS", d[:70])
 
@@ -431,21 +431,21 @@ v, d = smoke.schema_medal_check(json.dumps(sc_unrelated), GOOD_SPEC)
 check("I2 min_score in UNRELATED path -> UNVERIFIABLE (was false PASS)",
       v == "UNVERIFIABLE", d[:80])
 
-sc_constraint = {"properties": {"medal": {"min_score": {"type": "number", "minimum": 1}}}}
+sc_constraint = {"properties": {"medal": {"bronze": {"min_score": {"type": "number", "minimum": 1}}}}}
 v, d = smoke.schema_medal_check(json.dumps(sc_constraint), GOOD_SPEC)
 check("I3 schema-constraint node (type=number+minimum) -> PASS", v == "PASS", d[:70])
 
-sc_bare_desc = {"properties": {"medal": {"min_score": {"description": "the floor"}}}}
+sc_bare_desc = {"properties": {"medal": {"bronze": {"min_score": {"description": "the floor"}}}}}
 v, d = smoke.schema_medal_check(json.dumps(sc_bare_desc), GOOD_SPEC)
 check("I4 min_score node without numeric constraint -> UNVERIFIABLE",
       v == "UNVERIFIABLE", d[:70])
 
-sc_str_num = {"properties": {"medal": {"min_score": "1"}}}
+sc_str_num = {"properties": {"medal": {"bronze": {"min_score": "1"}}}}
 v, d = smoke.schema_medal_check(json.dumps(sc_str_num), GOOD_SPEC)
 check("I5 string-number min_score -> UNVERIFIABLE (no type coercion)",
       v == "UNVERIFIABLE", d[:70])
 
-sc_nan = json.loads(json.dumps({"properties": {"medal": {"min_score": float("nan")}}}))
+sc_nan = json.loads(json.dumps({"properties": {"medal": {"bronze": {"min_score": float("nan")}}}}))
 v, d = smoke.schema_medal_check(json.dumps(sc_nan), GOOD_SPEC)
 check("I6 NaN min_score -> UNVERIFIABLE (non-finite)", v == "UNVERIFIABLE", d[:70])
 
@@ -526,7 +526,7 @@ print("J.a threshold proof requires a numeric bound >0 (type:number is NOT proof
 
 
 def schema_check_of(minscore_node):
-    s = {"properties": {"medal": {"min_score": minscore_node}}}
+    s = {"properties": {"medal": {"bronze": {"min_score": minscore_node}}}}
     return smoke.schema_medal_check(json.dumps(s), GOOD_SPEC)
 
 
@@ -564,22 +564,22 @@ check("J10 /info floor=1 AND schema minimum=1 -> PASS (same value AND same "
       "comparison semantics — consistency proven)",
       v == "PASS" and "MATCHES" in d, d[:90])
 v, d = smoke.schema_medal_check(
-    json.dumps({"properties": {"medal": {"min_score": {"type": "number",
-                                                       "minimum": 1}}}}),
+    json.dumps({"properties": {"medal": {"bronze": {"min_score": {
+        "type": "number", "minimum": 1}}}}}),
     {"bronze": ">1"})
 check("J11 /info '>1' vs schema minimum=1 -> FAIL (op mismatch: >= is not >)",
       v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:90])
 v, d = smoke.schema_medal_check(
-    json.dumps({"properties": {"medal": {"min_score": {"type": "number",
-                                                       "exclusiveMinimum": 0}}}}),
+    json.dumps({"properties": {"medal": {"bronze": {"min_score": {
+        "type": "number", "exclusiveMinimum": 0}}}}}),
     {"bronze": ">0"})
 check("J12 schema bound 0 (cannot exclude 0-score) with /info '>0' -> UNVERIFIABLE",
       v == "UNVERIFIABLE", d[:90])
 
 # ------------- K. combined constraints: EFFECTIVE bound, never any()-matching
 print("K. combined constraints — all apply simultaneously; match on the effective (strictest) bound")
-multi = lambda m, em: {"properties": {"medal": {"min_score": {
-    "type": "number", "minimum": m, "exclusiveMinimum": em}}}}
+multi = lambda m, em: {"properties": {"medal": {"bronze": {"min_score": {
+    "type": "number", "minimum": m, "exclusiveMinimum": em}}}}}
 INFO_1 = {"bronze": {"min_score": 1}}  # /info semantics: score >= 1
 
 v, d = smoke.schema_medal_check(json.dumps(multi(1, 2)), INFO_1)
@@ -607,7 +607,7 @@ L_INFO = {"bronze": {"min_score": 1}}  # /info semantics: score >= 1
 
 def branch_schema(comb, *subs):
     """Medal min_score nodes spread across separate combinator branches."""
-    return {comb: [{"properties": {"medal": {"min_score": s}}} for s in subs]}
+    return {comb: [{"properties": {"medal": {"bronze": {"min_score": s}}}} for s in subs]}
 
 
 v, d = smoke.schema_medal_check(json.dumps(
@@ -645,6 +645,43 @@ v, d = smoke.schema_medal_check(json.dumps(
 check("L7 /info >=1 vs allOf{0.5, >0.5 branches} -> FAIL (combined effective "
       "threshold > 0.5 — cross-node, was per-node false-PASS territory)",
       v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:110])
+
+# ---------- M. round-10: property independence — bronze/silver/gold NEVER merged
+print("M. property independence — only the /info-declared property's nodes are judged")
+# bronze threshold minimum:1 and gold threshold exclusiveMinimum:2 as SIBLINGS
+schema_props = {"properties": {"medal": {
+    "bronze": {"min_score": {"minimum": 1}},
+    "gold": {"min_score": {"exclusiveMinimum": 2}}}}}
+v, d = smoke.schema_medal_check(json.dumps(schema_props), L_INFO)
+check("M1 /info bronze>=1 with sibling gold>2 -> PASS (gold is an INDEPENDENT "
+      "rule; its floor must not fail the bronze verdict)",
+      v == "PASS" and "MATCHES" in d and "other-property" in d, d[:120])
+v, d = smoke.schema_medal_check(json.dumps(
+    {"properties": {"medal": {"gold": {"min_score": {"exclusiveMinimum": 2}}}}}),
+    L_INFO)
+check("M2 bronze floor declared but only a gold threshold in schema -> "
+      "UNVERIFIABLE (bronze rule NOT schema-backed; other properties excluded)",
+      v == "UNVERIFIABLE" and "OTHER medal properties" in d, d[:120])
+v, d = smoke.schema_medal_check(json.dumps(
+    {"properties": {"medal": {"bronze": {"gold": {"min_score": {"minimum": 1}}}}}}),
+    L_INFO)
+check("M3 path naming two properties (bronze.gold) -> UNVERIFIABLE (ambiguous "
+      "target; no guessing which rule it belongs to)",
+      v == "UNVERIFIABLE" and "which medal property" in d, d[:120])
+v, d = smoke.schema_medal_check(json.dumps(
+    {"properties": {"medal": {"bronze": {"min_score": {"minimum": 1}},
+                              "silver": {"min_score": {"minimum": 5}}}}}),
+    L_INFO)
+check("M4 silver sibling does not participate -> PASS (bronze judged on its "
+      "own constraints only)",
+      v == "PASS" and "MATCHES" in d, d[:120])
+v, d = smoke.schema_medal_check(json.dumps(
+    {"allOf": [{"properties": {"medal": {"bronze": {"min_score": {"minimum": 1}},
+                                        "gold": {"min_score": {"exclusiveMinimum": 9}}}}}]}),
+    L_INFO)
+check("M5 allOf branch mixing bronze and gold siblings -> PASS (cross-branch "
+      "merging stays WITHIN the bronze property; gold excluded even across allOf)",
+      v == "PASS" and "MATCHES" in d, d[:120])
 
 # ----------------------------------------------------------------------------
 print(f"\n{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else " — all negative controls hold"))

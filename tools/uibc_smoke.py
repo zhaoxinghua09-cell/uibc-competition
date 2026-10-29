@@ -308,6 +308,22 @@ def _path_has_combinator(path: str, keys: tuple[str, ...]) -> bool:
     return bool({s for s in path.replace("[", ".").replace("]", "").split(".")} & set(keys))
 
 
+_MEDAL_PROPERTIES = ("bronze", "silver", "gold")
+
+
+def _medal_property_of(path: str) -> str | None:
+    """Which medal property a node's path belongs to (exact segment match).
+
+    bronze/silver/gold are INDEPENDENT rules with independent thresholds —
+    a gold floor must never be merged into the bronze verdict. Returns the
+    property name, or None when the path names no property (or ambiguously
+    names several) — the caller must then NOT guess.
+    """
+    segs = {s.lower() for s in path.replace("[", ".").replace("]", "").split(".")}
+    hits = [prop for prop in _MEDAL_PROPERTIES if prop in segs]
+    return hits[0] if len(hits) == 1 else None
+
+
 def _path_related_to_medal(path: str) -> bool:
     """A min_score node only counts when its structural path runs through a
     medal-rule subtree (e.g. $.properties.medal.min_score). A min_score in an
@@ -360,17 +376,46 @@ def schema_medal_check(schema_body: str | None, medals) -> tuple[str, str]:
                        or (isinstance(v, dict) and "min_score" in v)]
     if machine_declared:
         info_val, info_op = _bronze_floor_semantics(medals.get("bronze"))
-        applicable = [(p, v) for p, v in threshold_nodes
-                      if _path_related_to_medal(p)]
-        # combinator honesty first: anyOf/oneOf/not are NOT reliably parsed —
-        # never claim consistency from a structure whose branch semantics we
-        # cannot evaluate (allOf is handled below; it is simultaneous merging)
-        if any(_path_has_combinator(p, ("anyOf", "oneOf", "not"))
-               for p, _ in applicable):
-            return "UNVERIFIABLE", ("medal threshold node(s) appear under anyOf/oneOf/not — "
-                                    "branch-selection semantics are not reliably parsed here, "
-                                    "so no effective threshold can be computed; NOT reported "
-                                    "as schema-backed or consistent")
+        applicable = []      # nodes of the /info-declared property (bronze)
+        other_property = 0   # silver/gold thresholds: independent rules, NEVER merged
+        ambiguous = []       # property target not determinable -> no guessing
+        for p, v in threshold_nodes:
+            if not _path_related_to_medal(p):
+                continue
+            if _path_has_combinator(p, ("anyOf", "oneOf", "not")):
+                return "UNVERIFIABLE", ("medal threshold node(s) appear under anyOf/oneOf/not — "
+                                        "branch-selection semantics are not reliably parsed here, "
+                                        "so no effective threshold can be computed; NOT reported "
+                                        "as schema-backed or consistent")
+            prop = _medal_property_of(p)
+            if prop is None:
+                ambiguous.append(p)
+            elif prop == "bronze":
+                applicable.append((p, v))
+            else:
+                other_property += 1
+        if ambiguous:
+            return "UNVERIFIABLE", (f"cannot determine which medal property these threshold "
+                                    f"node(s) apply to: {ambiguous[:3]} — bronze/silver/gold are "
+                                    "independent rules with independent thresholds; merging "
+                                    "across properties would be a guess")
+        if not applicable:
+            if other_property:
+                return "UNVERIFIABLE", (f"/info declares a bronze floor but the schema only "
+                                        f"carries thresholds for OTHER medal properties "
+                                        f"({other_property} node(s), silver/gold) — the bronze "
+                                        "rule is NOT schema-backed; other properties' floors "
+                                        "are independent and are never merged into this verdict")
+            detail = "; ".join(
+                f"{p} ({'unrelated path' if not _path_related_to_medal(p) else _min_score_semantics(v)[1]})"
+                for p, v in threshold_nodes[:3])
+            if threshold_nodes:
+                return "UNVERIFIABLE", (f"/schema has min_score nodes but none PROVABLE as the medal "
+                                        f"threshold: {detail} — the rule's meaning cannot be "
+                                        "confirmed; NOT reported as schema-backed")
+            return "UNVERIFIABLE", (f"/schema mentions medal nodes {[p for p, _, _ in nodes][:3]} "
+                                    "but none carries a min_score threshold structure — the rule's "
+                                    "meaning cannot be confirmed; NOT reported as schema-backed")
         results = [(p, *_min_score_semantics(v)) for p, v in applicable]  # (p, ok, why, eff)
         proven = [(p, eff, why) for p, ok, why, eff in results if ok]
         unproven = [f"{p} ({why})" for p, ok, why, eff in results if not ok]
@@ -384,23 +429,19 @@ def schema_medal_check(schema_body: str | None, medals) -> tuple[str, str]:
         if proven:
             eff_op, eff_val = max((eff for _, eff, _ in proven),
                                   key=lambda t: (t[1], t[0] == ">"))
+            scope = (f" (bronze-rule nodes only; {other_property} other-property "
+                     f"threshold(s) excluded as independent rules)" if other_property else "")
             if (eff_op, eff_val) == (info_op, info_val):
                 return "PASS", (f"/schema effective threshold {eff_op} {eff_val} across "
-                                f"{len(proven)} constraint node(s) MATCHES the /info declared "
-                                f"floor ({info_op} {info_val}) "
-                                f"(paths: {[p for p, _, _ in proven][:3]})")
+                                f"{len(proven)} bronze constraint node(s) MATCHES the /info "
+                                f"declared floor ({info_op} {info_val}) "
+                                f"(paths: {[p for p, _, _ in proven][:3]}){scope}")
             return "FAIL", (f"CROSS-SOURCE MISMATCH: /info declares bronze floor {info_op} "
-                            f"{info_val} but the schema's medal-applicable constraints combine "
+                            f"{info_val} but the schema's bronze-applicable constraints combine "
                             f"to an effective threshold {eff_op} {eff_val} "
-                            f"({len(proven)} node(s): {[p for p, _, _ in proven][:3]}) — "
+                            f"({len(proven)} node(s): {[p for p, _, _ in proven][:3]}){scope} — "
                             "'a valid threshold exists' is NOT 'the two sources declare the "
                             "same threshold'")
-        detail = "; ".join(
-            f"{p} ({'unrelated path' if not _path_related_to_medal(p) else _min_score_semantics(v)[1]})"
-            for p, v in threshold_nodes[:3])
-        return "UNVERIFIABLE", (f"/schema has min_score nodes but none PROVABLE as the medal "
-                                f"threshold: {detail} — the rule's meaning cannot be "
-                                "confirmed; NOT reported as schema-backed")
     return "OBSERVE", (f"/schema describes medal fields at {[p for p, _, _ in nodes][:3]} "
                        "but /info declares no machine-readable floor")
 
