@@ -600,6 +600,52 @@ check("K4 /info >=2 vs schema {min:2, exclMin:2} -> FAIL (effective > 2 vs "
       "declared >= 2: same value, different direction)",
       v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:100])
 
+# ---------- L. round-9: CROSS-NODE combinators (allOf branches, anyOf honesty)
+print("L. cross-node combinators — allOf merges ALL branches; anyOf/oneOf/not -> UNVERIFIABLE")
+L_INFO = {"bronze": {"min_score": 1}}  # /info semantics: score >= 1
+
+
+def branch_schema(comb, *subs):
+    """Medal min_score nodes spread across separate combinator branches."""
+    return {comb: [{"properties": {"medal": {"min_score": s}}} for s in subs]}
+
+
+v, d = smoke.schema_medal_check(json.dumps(
+    branch_schema("allOf", {"minimum": 1}, {"exclusiveMinimum": 2})), L_INFO)
+check("L1 /info >=1 vs allOf{min:1, exclMin:2 branches} -> FAIL (combined "
+      "effective threshold > 2 — one matching branch must not hide a stricter one)",
+      v == "FAIL" and "effective threshold > 2.0" in d, d[:110])
+v, d = smoke.schema_medal_check(json.dumps(
+    branch_schema("allOf", {"minimum": 1}, {"minimum": 1})), L_INFO)
+check("L2 /info >=1 vs allOf{min:1, min:1 branches} -> PASS (branches genuinely "
+      "equivalent to /info)",
+      v == "PASS" and "MATCHES" in d, d[:110])
+v, d = smoke.schema_medal_check(json.dumps(
+    branch_schema("anyOf", {"minimum": 1}, {"exclusiveMinimum": 2})), L_INFO)
+check("L3 threshold under anyOf -> UNVERIFIABLE (branch-selection semantics not "
+      "reliably parsed; allOf/anyOf never conflated, no strictest-bound guessing)",
+      v == "UNVERIFIABLE" and "anyOf" in d, d[:110])
+v, d = smoke.schema_medal_check(json.dumps(
+    branch_schema("allOf", {"minimum": 1}, {"minimum": 5})), L_INFO)
+check("L4 /info >=1 vs allOf{min:1, min:5 branches} -> FAIL (combined effective "
+      "threshold >= 5 contradicts /info)",
+      v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:110])
+v, d = smoke.schema_medal_check(json.dumps(
+    branch_schema("allOf", {"minimum": 1}, {"type": "number"})), L_INFO)
+check("L5 allOf with one unprovable branch -> UNVERIFIABLE (branches apply "
+      "simultaneously; one proven branch cannot certify the rule)",
+      v == "UNVERIFIABLE" and "NOT provable" in d, d[:110])
+v, d = smoke.schema_medal_check(json.dumps(
+    branch_schema("allOf", {"minimum": 1})), L_INFO)
+check("L6 single-branch allOf regression -> PASS (degenerates to single node, "
+      "J10 semantics preserved)",
+      v == "PASS" and "MATCHES" in d, d[:110])
+v, d = smoke.schema_medal_check(json.dumps(
+    branch_schema("allOf", {"minimum": 0.5}, {"exclusiveMinimum": 0.5})), L_INFO)
+check("L7 /info >=1 vs allOf{0.5, >0.5 branches} -> FAIL (combined effective "
+      "threshold > 0.5 — cross-node, was per-node false-PASS territory)",
+      v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:110])
+
 # ----------------------------------------------------------------------------
 print(f"\n{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else " — all negative controls hold"))
 sys.exit(1 if FAILURES else 0)
