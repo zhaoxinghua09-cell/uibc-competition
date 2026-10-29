@@ -576,6 +576,30 @@ v, d = smoke.schema_medal_check(
 check("J12 schema bound 0 (cannot exclude 0-score) with /info '>0' -> UNVERIFIABLE",
       v == "UNVERIFIABLE", d[:90])
 
+# ------------- K. combined constraints: EFFECTIVE bound, never any()-matching
+print("K. combined constraints — all apply simultaneously; match on the effective (strictest) bound")
+multi = lambda m, em: {"properties": {"medal": {"min_score": {
+    "type": "number", "minimum": m, "exclusiveMinimum": em}}}}
+INFO_1 = {"bronze": {"min_score": 1}}  # /info semantics: score >= 1
+
+v, d = smoke.schema_medal_check(json.dumps(multi(1, 2)), INFO_1)
+check("K1 /info >=1 vs schema {min:1, exclMin:2} -> FAIL (effective threshold "
+      "is > 2, not any()-matched minimum=1)",
+      v == "FAIL" and "effective threshold > 2.0" in d, d[:100])
+v, d = smoke.schema_medal_check(json.dumps(multi(1, 0)), INFO_1)
+check("K2 /info >=1 vs schema {min:1, exclMin:0} -> PASS (effective threshold "
+      "is >= 1: the looser redundant constraint does not tighten the rule)",
+      v == "PASS" and "MATCHES" in d, d[:100])
+v, d = smoke.schema_medal_check(json.dumps(multi(2, 2)),
+                                {"bronze": ">2"})
+check("K3 /info >2 vs schema {min:2, exclMin:2} -> PASS (effective > 2, same "
+      "value AND direction)",
+      v == "PASS" and "MATCHES" in d, d[:100])
+v, d = smoke.schema_medal_check(json.dumps(multi(2, 2)), INFO_1)
+check("K4 /info >=2 vs schema {min:2, exclMin:2} -> FAIL (effective > 2 vs "
+      "declared >= 2: same value, different direction)",
+      v == "FAIL" and "CROSS-SOURCE MISMATCH" in d, d[:100])
+
 # ----------------------------------------------------------------------------
 print(f"\n{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else " — all negative controls hold"))
 sys.exit(1 if FAILURES else 0)

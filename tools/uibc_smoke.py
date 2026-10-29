@@ -236,66 +236,54 @@ def _find_schema_nodes(node, keys, path="$"):
     return out
 
 
-def _min_score_semantics(v) -> tuple[bool, str]:
-    """Semantic proof standard for a min_score node's VALUE (round-6, P1 fix).
+def _min_score_semantics(v) -> tuple[bool, str, tuple[str, float] | None]:
+    """Semantic proof standard for a min_score node's VALUE (rounds 6-8).
 
-    "The field is numeric" is NOT "a threshold exists". A threshold is PROVEN
-    only when BOTH hold:
-      1. a threshold VALUE exists — either the node is itself a literal finite
-         number, or the constraint node carries a numeric minimum /
-         exclusiveMinimum bound;
-      2. a COMPARISON SEMANTICS exists that excludes zero-score entrants —
-         the bound must be finite and > 0 (minimum=0 or a negative bound
-         cannot exclude a 0-score medal, and an invalid bound value — string,
-         bool, null, NaN — proves nothing).
-    Returns (proven, why); when proven, `why` embeds the bound's value and
-    comparison operator for cross-source matching.
-    Anything less -> not provable -> UNVERIFIABLE upstream.
+    "The field is numeric" is NOT "a threshold exists". When the node declares
+    MULTIPLE constraints, JSON Schema semantics make ALL of them apply
+    simultaneously — the node's EFFECTIVE threshold is the strictest one, not
+    "any constraint that happens to match /info". A threshold is PROVEN only
+    when the EFFECTIVE bound:
+      1. exists (a literal finite number, or at least one numeric
+         minimum/exclusiveMinimum constraint);
+      2. excludes a 0-score entrant (finite and > 0);
+      3. is computed as a single (comparison_op, value) pair BEFORE any
+         cross-source comparison — never via any()-style partial matching.
+    Returns (proven, why, effective) where effective is the (op, value) pair
+    or None. Any invalid constraint value (string/bool/NaN) poisons the whole
+    node: the schema itself is broken, nothing is provable from it.
     """
     if isinstance(v, bool) or v is None:
-        return False, f"min_score value {v!r} is not numeric (bool/None rejected)"
+        return False, f"min_score value {v!r} is not numeric (bool/None rejected)", None
     if isinstance(v, (int, float)):
         if not math.isfinite(v):
-            return False, "min_score is a non-finite number (NaN/Inf)"
+            return False, "min_score is a non-finite number (NaN/Inf)", None
         if v <= 0:
-            return False, f"literal threshold {v} cannot exclude zero-score entrants (must be >0)"
-        return True, f"literal threshold {v} (>0: a 0-score entrant is below the floor)"
+            return False, f"literal threshold {v} cannot exclude zero-score entrants (must be >0)", None
+        return True, f"literal threshold {v} (>0: a 0-score entrant is below the floor)", (">=", float(v))
     if isinstance(v, dict):
-        bounds = []
+        constraints = []
         for key in ("minimum", "exclusiveMinimum"):
             if key in v:
                 b = v[key]
                 if isinstance(b, bool) or not isinstance(b, (int, float)) \
                         or not math.isfinite(b):
                     return False, (f"{key}={b!r} is not a finite number — invalid "
-                                   "constraint value proves no threshold")
-                if b <= 0:
-                    return False, (f"{key}={b} cannot exclude zero-score entrants "
-                                   "(zero/negative threshold)")
-                op = ">=" if key == "minimum" else ">"
-                bounds.append(f"{key}={b} ({op}0 semantics: a 0-score entrant is excluded)")
-        if bounds:
-            return True, "; ".join(bounds)
-        return False, (f"min_score node declares type={v.get('type')!r} but NO numeric "
-                       "bound (minimum/exclusiveMinimum) — a numeric TYPE alone does not "
-                       "prove a threshold VALUE or its comparison semantics")
-    return False, f"min_score value has non-numeric type {type(v).__name__}"
-
-
-def _min_score_bound(v) -> list[tuple[str, float]]:
-    """(comparison_op, value) pairs declared by a SEMANTICALLY PROVEN min_score
-    node (call only after _min_score_semantics returned True). A literal node
-    means the field itself is the floor: score >= value. minimum -> >=,
-    exclusiveMinimum -> >."""
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        return [(">=", float(v))]
-    if isinstance(v, dict):
-        out = []
-        for key in ("minimum", "exclusiveMinimum"):
-            if key in v:
-                out.append((">=" if key == "minimum" else ">", float(v[key])))
-        return out
-    return []
+                                   "constraint value proves no threshold"), None
+                constraints.append((">=" if key == "minimum" else ">", float(b)))
+        if not constraints:
+            return False, (f"min_score node declares type={v.get('type')!r} but NO numeric "
+                           "bound (minimum/exclusiveMinimum) — a numeric TYPE alone does not "
+                           "prove a threshold VALUE or its comparison semantics"), None
+        # effective bound = the STRICTEST constraint: larger value wins; at the
+        # same value, exclusiveMinimum (>) is stricter than minimum (>=)
+        eff_op, eff_val = max(constraints, key=lambda t: (t[1], t[0] == ">"))
+        if eff_val <= 0:
+            return False, (f"effective threshold {eff_op} {eff_val} (from {constraints}) "
+                           "cannot exclude zero-score entrants"), None
+        why = f"effective threshold {eff_op} {eff_val} (strictest of {constraints})"
+        return True, why, (eff_op, eff_val)
+    return False, f"min_score value has non-numeric type {type(v).__name__}", None
 
 
 def _bronze_floor_semantics(bronze_spec) -> tuple[float | None, str | None]:
@@ -366,17 +354,20 @@ def schema_medal_check(schema_body: str | None, medals) -> tuple[str, str]:
         for p, v in threshold_nodes:
             if not _path_related_to_medal(p):
                 continue
-            ok, why = _min_score_semantics(v)
+            ok, why, eff = _min_score_semantics(v)
             if ok:
-                proven.append((p, _min_score_bound(v), why))
-        matching = [(p, b, why) for p, b, why in proven
-                    if any(op == info_op and val == info_val for op, val in b)]
+                proven.append((p, eff, why))
+        # exact match on the EFFECTIVE bound — no any()-style partial matching:
+        # a schema with several constraints is matched by its strictest one
+        matching = [(p, eff, why) for p, eff, why in proven
+                    if eff == (info_op, info_val)]
         if matching:
             return "PASS", (f"/schema threshold at {[p for p, _, _ in matching][:3]} MATCHES the "
                             f"/info declared floor ({info_op} {info_val}): value AND comparison "
                             f"semantics agree ({matching[0][2]})")
         if proven:
-            detail = "; ".join(f"{p} declares {b}" for p, b, _ in proven[:3])
+            detail = "; ".join(f"{p} effective threshold {eff[0]} {eff[1]}"
+                               for p, eff, _ in proven[:3])
             return "FAIL", (f"CROSS-SOURCE MISMATCH: /info declares bronze floor {info_op} "
                             f"{info_val} but the schema's medal-related threshold(s) disagree: "
                             f"{detail} — 'a valid threshold exists' is NOT 'the two sources "
