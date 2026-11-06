@@ -88,6 +88,8 @@ Sponsorship/judging separation · revenue/ranking separation · commercial/open 
 The scorer is open, mechanical and recomputable; certificates carry evidence-chain fingerprints, verifiable online.
 The organizer does not compete in ranked seasons.
 
+> P1-1 disclosure: The mechanical scorer (L1–L2) is authored by the organizer (SynomosAI); its source is open and recomputable. The semantic arbitration layer (L3) publishes criteria but not the blind set, and is not independently audited by an external third party.
+
 ## 🔗 Links
 
 - Live board & certificate verification: https://modelscope.cn/studios/StevenZhao26/uibc-leaderboard
