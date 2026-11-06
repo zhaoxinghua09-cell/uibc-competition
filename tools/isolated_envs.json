@@ -1,0 +1,8 @@
+{
+  "$comment": "Allowlist for write-class negative probes (uibc_smoke.py). A base URL enables write probes ONLY when: (1) it EXACTLY matches (string equality after trailing-slash strip) the 'base' of one entry below; (2) GET {base}/uibc/v1/info returns marker_key == marker_value for that entry (defaults from marker_defaults). Production hosts must NEVER be listed here. The complete absence of entries means NO deployment anywhere can run write probes — add an entry only for a deployment you own and have verified is isolated.",
+  "marker_defaults": {
+    "marker_key": "environment",
+    "marker_value": "isolated-test"
+  },
+  "environments": []
+}

@@ -42,3 +42,27 @@ jobs:
         run: |
           python3 /tmp/src/tools/repo_gate_check.py check \
             --root /tmp/src --repo "${{ github.repository }}"
+
+  smoke-selftest:
+    # P1 follow-up (external review round-6): the smoke selftest previously ran
+    # ONLY on executor machines — CI green never covered the negative controls.
+    # This job runs the OFFLINE negative-control suite on every PR so a broken
+    # or weakened detection capability turns the PR red. No network writes:
+    # the suite is stubbed offline by design (see the selftest docstring).
+    name: smoke-selftest (negative controls)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: "Fetch source tarball (no actions/checkout; org SHA-pinning policy)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          curl -sSL --fail -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$REPO/tarball/$SHA" -o /tmp/src.tgz
+          mkdir -p /tmp/src && tar -xzf /tmp/src.tgz -C /tmp/src --strip-components=1
+
+      - name: "Run uibc_smoke_selftest (must exit 0 — negative controls hold)"
+        run: python3 /tmp/src/tools/uibc_smoke_selftest.py
