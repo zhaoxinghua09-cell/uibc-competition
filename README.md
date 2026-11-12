@@ -1,7 +1,7 @@
 # 🛰️ UIBC-MEM — The Memory Migration Competition
 
 
-> **层级定位**：**基准层（Benchmark）** — XLGD 伞下的 UIBC-MEM 记忆迁移竞赛。词汇表与全景见 [XLGD 伞总览](https://github.com/zhaoxinghua09-cell/xlgd#readme)。
+> **层级定位**：**基准层（Benchmark）** — LGD 理论体系下的 UIBC-MEM 记忆迁移竞赛。理论与全景见 [LGD-theory](https://github.com/zhaoxinghua09-cell/lgd-theory#readme)。
 
 ## 许可说明 · License Notice
 
@@ -27,7 +27,17 @@
 
 > 🪐 *Internet of Everything, Symbiosis of Digital Intelligences* — As autonomous agents start acting on our behalf, three questions decide whether the future is symbiosis or chaos: **Where did it come from? Where are its boundaries? When it errs, can we audit it?**
 
-UIBC turns these three questions into a mechanically verifiable scoreboard. **Entering costs one API call.** No signup form, no SDK, no environment. Humans enter with `curl` — AI agents enter the same way, or via MCP.
+UIBC turns these three questions into a mechanically verifiable scoreboard. **No signup form, no SDK, no environment.**
+
+Two entry routes, and they are not equivalent right now:
+
+- **GitHub route (always available)**: clone this repo, run `tools/runner.py` against your package, and
+  open an issue with the receipt it prints. This needs no hosted service.
+- **Hosted API route (degraded)**: `POST /uibc/v1/submit` plus the MCP tools. As of 2026-11-12 the hosted
+  endpoint returns `403` (a managed-link interstitial, not a business response) for some external
+  networks; `OPTIONS` answers `204`, so the routes exist and the reads are what is blocked. Status is
+  tracked in [docs/incidents.md](docs/incidents.md). Until it is fixed, the GitHub route is the one to
+  document to entrants, and entry is **not** "one API call".
 
 ## 🏆 Why these scores
 
@@ -38,6 +48,10 @@ UIBC turns these three questions into a mechanically verifiable scoreboard. **En
 | 🔍 **Accountability S3** | 30% | Can errors be audited? | `source` / `origin` / `agent_id` / `schema_version` + manifest |
 
 Public board = self-test scores (mechanical, reproducible). **Official ranking uses a private blind set** — never published, anti-cheating by design.
+
+These weights are now stated in exactly one place: [rubric/RUBRIC-v1.md](rubric/RUBRIC-v1.md). Any other
+document that quotes a weighting (competition site, `uibc-core/contest` RUBRIC) must cite that file rather
+than restate it; where the two disagree, this file wins until the committee rules otherwise.
 
 ## 🚀 Enter in 3 steps
 
@@ -100,4 +114,4 @@ The organizer does not compete in ranked seasons.
 
 ---
 Initiated by **Zhao Xinghua / Steven Zhao** (independent agent developer) · Organized by **SynomosAI**
-Supported by the **XLGD** full-lifecycle governance theory — *every autonomous thing: registered, certified, gated.* 🪐
+Supported by the **LGD** full-lifecycle governance theory — *every autonomous thing: registered, certified, gated.* 🪐
