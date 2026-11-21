@@ -57,6 +57,13 @@ class Result:
     def failed(self) -> list[dict]:
         return [r for r in self.rows if r["verdict"] == "FAIL"]
 
+    @property
+    def unknown(self) -> list[dict]:
+        """Evidence-missing states. They must NOT be counted as PASS/FAIL and must
+        NOT let the job go green silently (see overall())."""
+        return [r for r in self.rows
+                if r["verdict"] in ("UNKNOWN", "UNAVAILABLE", "INCONCLUSIVE")]
+
 
 def call(method: str, path: str, body: dict | None = None, timeout: int = 25):
     req = urllib.request.Request(
@@ -177,14 +184,34 @@ def run(allow_reject: bool) -> Result:
                 "not run (add --allow-reject-probes); write-class POSTs stay off by default")
 
     # ---- 7. pollution assertion
+    # Evidence missing is UNKNOWN, not "proven pollution". A read-only arm with
+    # writes_performed=0 cannot pollute the production board.
     total_after = board_total()
-    if total_before is not None and total_before == total_after:
+    if total_before is None or total_after is None:
+        res.add("pollution: board total unchanged", "UNKNOWN",
+                "leaderboard unreachable; pollution not assessable; "
+                f"writes_performed={res.writes_performed}")
+    elif total_before == total_after:
         res.add("pollution: board total unchanged", "PASS",
                 f"total_agents {total_before} -> {total_after} (writes_performed={res.writes_performed})")
     else:
         res.add("pollution: board total unchanged", "FAIL",
                 f"total_agents {total_before} -> {total_after} — production board may be polluted")
     return res
+
+
+def overall(res: "Result") -> tuple[str, int]:
+    """Fail-closed: FAIL -> RED / 1, UNKNOWN-only -> DEGRADED / 1, else GREEN / 0.
+
+    Keeping a non-zero exit for UNKNOWN preserves the workflow contract
+    ("must be able to go red when the service degrades") without mislabelling an
+    unavailable leaderboard as a proven production-board pollution.
+    """
+    if res.failed:
+        return "RED", 1
+    if res.unknown:
+        return "DEGRADED", 1
+    return "GREEN", 0
 
 
 def main() -> int:
@@ -196,15 +223,18 @@ def main() -> int:
 
     print(f"uibc_smoke @ {BASE}  ({datetime.now(timezone.utc).isoformat()})")
     res = run(args.allow_reject_probes)
-    verdict = "GREEN" if not res.failed else "RED"
+    verdict, exit_code = overall(res)
     payload = {"base": BASE, "when": datetime.now(timezone.utc).isoformat(),
-               "verdict": verdict, "writes_performed": res.writes_performed, "rows": res.rows}
-    print(f"verdict: {verdict}  ({len(res.failed)} FAIL / {len(res.rows)} probes)")
+               "verdict": verdict, "writes_performed": res.writes_performed,
+               "fail_count": len(res.failed), "unknown_count": len(res.unknown),
+               "rows": res.rows}
+    print(f"verdict: {verdict}  ({len(res.failed)} FAIL / "
+          f"{len(res.unknown)} UNKNOWN / {len(res.rows)} probes)")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
         print("written:", args.out)
-    return 1 if res.failed else 0
+    return exit_code
 
 
 if __name__ == "__main__":
