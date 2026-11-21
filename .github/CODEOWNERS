@@ -1,0 +1,6 @@
+# CODEOWNERS — routing only; branch gating is enforced by the lgd-standard-gate ruleset.
+
+*                                   @zhaoxinghua09-cell
+/.github/                           @zhaoxinghua09-cell
+/.github/workflows/                 @zhaoxinghua09-cell
+/SECURITY.md                        @zhaoxinghua09-cell
