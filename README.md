@@ -19,6 +19,9 @@
   **均未申请实体注册、未申请商标注册**；出现仅作来源标识，
   不构成对法人实体或商标权的任何主张。
 - **免责**：本仓库内容不构成法规意见或注册代理服务；关键数据以监管机构最新发布为准。
+- **仓库状态（诚实披露）**：本仓库当前为 **pre-release**——`CHANGELOG.md` 仅有 `[Unreleased]`，
+  无任何带 git tag 的正式发布版本。评测权重、盲测集规模与采样方法均以 `rubric/RUBRIC-v1.md`
+  当前内容为准，属**草案/进行中**状态，不构成"已发布国际基准"。对外请勿使用"权威基准/已发布版本"措辞。
 
 ---
 
@@ -31,8 +34,10 @@ UIBC turns these three questions into a mechanically verifiable scoreboard. **No
 
 Two entry routes, and they are not equivalent right now:
 
-- **GitHub route (always available)**: clone this repo, run `tools/runner.py` against your package, and
-  open an issue with the receipt it prints. This needs no hosted service.
+- **GitHub route (always available)**: clone this repo, prepare your memory package following
+  `rubric/RUBRIC-v1.md` and the `criteria/` frameworks, run `tools/repo_gate_check.py check` to self-verify
+  packaging, and open an issue with the receipt. This needs no hosted service. (There is no `tools/runner.py`;
+  the verification tooling in this repo is `repo_gate_check.py` and `uibc_smoke.py`.)
 - **Hosted API route (degraded)**: `POST /uibc/v1/submit` plus the MCP tools. As of 2026-11-12 the hosted
   endpoint returns `403` (a managed-link interstitial, not a business response) for some external
   networks; `OPTIONS` answers `204`, so the routes exist and the reads are what is blocked. Status is
@@ -52,6 +57,10 @@ Public board = self-test scores (mechanical, reproducible). **Official ranking u
 These weights are now stated in exactly one place: [rubric/RUBRIC-v1.md](rubric/RUBRIC-v1.md). Any other
 document that quotes a weighting (competition site, `uibc-core/contest` RUBRIC) must cite that file rather
 than restate it; where the two disagree, this file wins until the committee rules otherwise.
+
+> ⚠️ **已知外部不一致（需外发修正）**：公开竞赛站点 `medxpert.cn/uibc/` 当前仍显示三维**等权（各 1/3）**，
+> 与本文档 / `rubric/RUBRIC-v1.md` 的 40/30/30 不一致。该站点属线上资产，修正需单独授权；在站点更正前，
+> 本仓库以 `RUBRIC-v1.md` 为唯一权威，对外引用请以 RUBRIC-v1 为准。
 
 ## 🚀 Enter in 3 steps
 
