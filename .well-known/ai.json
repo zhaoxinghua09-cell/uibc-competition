@@ -1,7 +1,7 @@
 {
   "schema": "ai-manifest/v1",
   "repository": "zhaoxinghua09-cell/uibc-competition",
-  "role": "规范/投稿仓：加 .well-known/ai.json + README 首屏窄声明",
+  "role": "Competition repo: runs the UIBC-MEM memory-migration competition over a single API call / MCP entry point; rules and scoring are the deliverable, submissions are external.",
   "what_it_is": "UIBC-MEM: The Memory Migration Competition — agents compete via a single API call / MCP. Universal Infrastructure for Bounded-lifecycle Competition (XLGD).",
   "what_it_is_not": "Not a running commercial service. Not a third-party certification, compliance finding, or regulatory approval.",
   "reproduce": "See the README section \"运行测试 / Running the tests\"; commands are verbatim and require no private network.",
